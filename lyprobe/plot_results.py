@@ -145,13 +145,21 @@ def plot_cosine(plt, results, path):
             color = TRACK_COLORS.get(t, OTHER_MODEL) if tree else TRACK_COLORS["trunk"]
             lab = f" ({t})" if tree else ""
             ax.plot(xs, [p["s_spk"] for p in ps], marker="o", ms=3, lw=2, color=color,
-                    label="same speaker, diff sentence" + lab)
+                    label="SAME speaker, diff sentence" + lab)
             bx.plot(xs, [p["s_spk"] - p["s_none"] for p in ps], marker="o", ms=3, lw=2,
                     color=color, label=t if tree else res["model"])
         ax.plot(tx, [p["s_txt"] for p in trunk], ls="--", lw=1.6, color="#7c7b76",
-                label="diff speaker, same sentence" + (" (trunk)" if tree else ""))
+                label="SAME sentence, diff speaker" + (" (trunk)" if tree else ""))
         ax.plot(tx, [p["s_none"] for p in trunk], ls=":", lw=1.6, color="#2b2b2b",
-                label="diff speaker, diff sentence" + (" (trunk)" if tree else ""))
+                label="diff sentence, diff speaker (unrelated)" + (" (trunk)" if tree else ""))
+        # label the two reference lines on the plot itself, not only in the legend
+        mid = len(trunk) // 2
+        ax.annotate("same sentence, different speaker", (tx[mid], trunk[mid]["s_txt"]),
+                    xytext=(0, 8), textcoords="offset points", ha="center", fontsize=9,
+                    color="#555")
+        ax.annotate("different sentence, different speaker", (tx[mid], trunk[mid]["s_none"]),
+                    xytext=(0, -14), textcoords="offset points", ha="center", fontsize=9,
+                    color="#2b2b2b")
         ax.set_title(f"{res['model']}: mean cosine by pair type (z-scored features)", fontsize=10)
         ref = "   ".join(f"{k} {v['s_spk'] - v['s_none']:.2f}" for k, v in base.items())
         bx.set_title(f"{res['model']}: same-speaker bonus  s_spk - s_none\n"
@@ -160,6 +168,7 @@ def plot_cosine(plt, results, path):
             a.axhline(0, color="k", lw=.6)
             a.set_xlabel("depth (layers from the input embedding)")
             a.grid(alpha=.3)
+        ax.set_ylim(-0.13, 0.97)
         ax.legend(fontsize=7, loc="center right")
         bx.legend(fontsize=7, loc="upper right")
     axes[0][0].set_ylabel("mean cosine similarity")
