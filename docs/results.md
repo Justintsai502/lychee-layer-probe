@@ -48,8 +48,9 @@ representations.
 
 Mean cosine between utterance-mean vectors (z-scored per dimension), for three kinds of
 pairs: same speaker / different sentence (`s_spk`), different speaker / same sentence
-(`s_txt`), and different speaker / different sentence (`s_none`, nothing shared). The lower
-row zooms in on the same-speaker bonus `s_spk - s_none`.
+(`s_txt`), and different speaker / different sentence (`s_none`, nothing shared). In
+Lychee the same-speaker line is drawn once per path (trunk, control, speech, merge); the
+bonus numbers below are `s_spk - s_none`.
 
 ![cosine](fig_cosine.png)
 
