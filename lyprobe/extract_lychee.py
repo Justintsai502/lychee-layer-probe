@@ -58,6 +58,29 @@ def point_table(n_trunk, branch_at, n_branch):
 
 # ---------------------------------------------------------------- model side
 
+def resolve_model_dir(model_dir):
+    """Return the folder holding config.json + weights, or exit with what is actually there.
+
+    Without a local config.json, transformers treats the path as a Hub repo id and fails
+    with a misleading HFValidationError. The official README downloads with
+    --include "lychee_full_duplex/*", which nests the files one level down.
+    """
+    model_dir = Path(model_dir)
+    if (model_dir / "config.json").exists():
+        return model_dir
+    nested = sorted(model_dir.glob("*/config.json")) if model_dir.is_dir() else []
+    if len(nested) == 1:
+        print(f"using {nested[0].parent} (config.json found one level down)")
+        return nested[0].parent
+    found = sorted(p.name for p in model_dir.iterdir())[:20] if model_dir.is_dir() else None
+    raise SystemExit(
+        f"no config.json in {model_dir}\n"
+        f"  contents: {found if found is not None else 'folder does not exist'}\n"
+        f"  download: export HF_HOME=$PWD/cache/huggingface && "
+        f"hf download HIT-TMG/Lychee-FD --local-dir {model_dir}\n"
+        f"  or pass --model-dir to the folder that contains config.json")
+
+
 def load_lychee(model_dir, code_dir, device, attn):
     import torch
 
@@ -182,6 +205,7 @@ def main():
         rows = rows[:cfg.limit]
     root = cfg.tts_dir or cfg.manifest.parent
 
+    cfg.model_dir = resolve_model_dir(cfg.model_dir)
     model = load_lychee(cfg.model_dir, cfg.code_dir, cfg.device, cfg.attn)
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_dir, use_fast=False, trust_remote_code=True)
     c = model.config
