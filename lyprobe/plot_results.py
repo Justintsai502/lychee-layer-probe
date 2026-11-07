@@ -73,6 +73,56 @@ def draw(ax, results, key, ylabel):
     ax.legend(fontsize=8, loc="best")
 
 
+def head_series(res):
+    """The three 4-layer heads aligned on 'layers into the head' (0 = the branch input).
+
+    text    = trunk layers after the speech branch point (the text head reads trunk end)
+    speech  = stoken layers, then merge layers continuing at 5..8
+    control = control layers; its input is an EARLIER trunk layer than the other two
+    """
+    by = {p["point"]: p for p in res["points"]}
+    sp = [p for p in res["points"] if p["track"] == "speech"]
+    ct = [p for p in res["points"] if p["track"] == "control"]
+    mg = [p for p in res["points"] if p["track"] == "merge"]
+    s_at, c_at = sp[0]["depth"] - 1, ct[0]["depth"] - 1
+    n_trunk = max(p["depth"] for p in res["points"] if p["track"] == "trunk")
+    text = [by[f"trunk_{d}"] for d in range(s_at, n_trunk + 1)]
+    return {
+        f"text head (trunk {s_at + 1}-{n_trunk})": ("trunk", text),
+        f"speech head (from trunk {s_at})": ("speech", [by[f"trunk_{s_at}"]] + sp),
+        "merge (after speech)": ("merge", [sp[-1]] + mg),
+        f"control head (from trunk {c_at})": ("control", [by[f"trunk_{c_at}"]] + ct),
+    }, s_at, c_at
+
+
+def plot_heads(plt, res, path):
+    series, s_at, c_at = head_series(res)
+    panels = [("acoustic_share", "acoustic share  (1 = voice only)"),
+              ("excess_spk", "voice: variance explained by speaker"),
+              ("excess_sent", "content: variance explained by sentence"),
+              ("spk_acc", "speaker probe accuracy")]
+    fig, axes = plt.subplots(1, 4, figsize=(20, 4.8))
+    for ax, (key, ylabel) in zip(axes, panels):
+        for label, (track, ps) in series.items():
+            start = len(series[next(iter(series))][1]) - 1 if track == "merge" else 0
+            xs = list(range(start, start + len(ps)))
+            ax.plot(xs, [p[key] for p in ps], marker="o", ms=4, lw=2, color=TRACK_COLORS[track],
+                    ls="--" if track == "merge" else "-", label=label)
+        if key == "spk_acc":
+            ax.axhline(res["chance_speaker_probe"], color="k", lw=.8)
+        ax.axvline(4, color="#9a998f", lw=.8, ls=":")
+        ax.set_xticks(range(0, 9))
+        ax.set_xlabel("layers into the head  (0 = branch input)")
+        ax.set_ylabel(ylabel)
+        ax.grid(alpha=.3)
+    axes[0].legend(fontsize=8, loc="upper left")
+    fig.suptitle(f"{res['model']}: the three 4-layer heads side by side  "
+                 f"(text & speech read trunk {s_at}, control reads trunk {c_at})", fontsize=11)
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    print(f"wrote {path}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -106,6 +156,10 @@ def main():
         fig.savefig(cfg.out / fname, dpi=160)
         plt.close(fig)
         print(f"wrote {cfg.out / fname}")
+
+    tree = next((r for r in results if len(track_lines(r["points"])) > 1), None)
+    if tree:
+        plot_heads(plt, tree, cfg.out / "fig_heads.png")
 
     # the two parts behind acoustic_share, side by side
     fig, axes = plt.subplots(1, 2, figsize=(15, 5))

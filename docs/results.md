@@ -23,6 +23,27 @@ which are exact, so no model run was needed.
 
 ![variance](fig_variance.png)
 
+## 4. The three heads side by side
+
+Each head on its own x-axis, from its branch input (0) through its 4 layers. Text and
+speech both read trunk layer 24; control reads trunk layer 20. Merge continues after
+speech at 5-8.
+
+![heads](fig_heads.png)
+
+- **Text head** stays where the trunk left it: voice ~0.01, content 0.82 → 0.76, probe ~0.13.
+- **Speech head** moves the other way: voice share rises at every layer (0.010 → 0.034,
+  then 0.118 at layer 4), content falls 0.82 → 0.44, and the speaker probe doubles
+  (0.14 → 0.28).
+- **Control head** does the same thing, more mildly: voice 0.012 → 0.039, content
+  0.79 → 0.61, probe 0.16 → 0.26.
+- **Merge** reverses the speech head, pulling it back toward content as it adds the next
+  text token's embedding.
+
+All three heads start from nearly the same point (acoustic share ~0.01) and separate in
+their own layers. This is the modality separation Lychee was designed for, visible in the
+representations.
+
 ## Key numbers
 
 | point | depth | acoustic share | voice var. | content var. | speaker probe |
