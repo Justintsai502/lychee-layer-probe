@@ -152,14 +152,20 @@ def plot_cosine(plt, results, path):
                 label="SAME sentence, diff speaker" + (" (trunk)" if tree else ""))
         ax.plot(tx, [p["s_none"] for p in trunk], ls=":", lw=1.6, color="#2b2b2b",
                 label="diff sentence, diff speaker (unrelated)" + (" (trunk)" if tree else ""))
-        # label the two reference lines on the plot itself, not only in the legend
+        # label all three pair types on the plot, each in its own line's colour
         mid = len(trunk) // 2
-        ax.annotate("same sentence, different speaker", (tx[mid], trunk[mid]["s_txt"]),
+        ax.annotate("same sentence, different speaker  (- - -)", (tx[mid], trunk[mid]["s_txt"]),
                     xytext=(0, 8), textcoords="offset points", ha="center", fontsize=9,
                     color="#555")
-        ax.annotate("different sentence, different speaker", (tx[mid], trunk[mid]["s_none"]),
-                    xytext=(0, -14), textcoords="offset points", ha="center", fontsize=9,
-                    color="#2b2b2b")
+        peak = max(trunk, key=lambda p: p["s_spk"])
+        ax.annotate("same speaker, different sentence  (solid)", (peak["depth"], peak["s_spk"]),
+                    xytext=(10, 22), textcoords="offset points", fontsize=9,
+                    color=TRACK_COLORS["trunk"],
+                    arrowprops=dict(arrowstyle="-", color=TRACK_COLORS["trunk"], lw=.8))
+        ax.annotate("different sentence, different speaker  (dotted)",
+                    (tx[mid], trunk[mid]["s_none"]), xytext=(0, -26), textcoords="offset points", va="top",
+                    ha="center", fontsize=9, color="#2b2b2b",
+                    arrowprops=dict(arrowstyle="-", color="#2b2b2b", lw=.8))
         ax.set_title(f"{res['model']}: mean cosine by pair type (z-scored features)", fontsize=10)
         ref = "   ".join(f"{k} {v['s_spk'] - v['s_none']:.2f}" for k, v in base.items())
         bx.set_title(f"{res['model']}: same-speaker bonus  s_spk - s_none\n"
@@ -168,7 +174,7 @@ def plot_cosine(plt, results, path):
             a.axhline(0, color="k", lw=.6)
             a.set_xlabel("depth (layers from the input embedding)")
             a.grid(alpha=.3)
-        ax.set_ylim(-0.13, 0.97)
+        ax.set_ylim(-0.28, 0.97)
         ax.legend(fontsize=7, loc="center right")
         bx.legend(fontsize=7, loc="upper right")
     axes[0][0].set_ylabel("mean cosine similarity")
