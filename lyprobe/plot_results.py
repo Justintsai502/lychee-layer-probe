@@ -123,6 +123,41 @@ def plot_heads(plt, res, path):
     print(f"wrote {path}")
 
 
+def plot_cosine(plt, results, path):
+    """Mean cosine of same-speaker / different-sentence pairs per layer, with the two
+    reference pair types. Rows: z-scored features (main), raw features (reference)."""
+    if not all("s_spk" in r["points"][0] for r in results):
+        print("result JSONs have no s_spk yet (re-run analysis on the server); skipped fig_cosine.png")
+        return
+    fig, axes = plt.subplots(2, len(results), figsize=(8 * len(results), 9), squeeze=False)
+    for col, res in enumerate(results):
+        lines = track_lines(res["points"])
+        tree = len(lines) > 1
+        for row, suf in enumerate(("", "_raw")):
+            ax = axes[row][col]
+            for t, ps in lines.items():
+                xs = [p["depth"] for p in ps]
+                color = TRACK_COLORS.get(t, OTHER_MODEL) if tree else TRACK_COLORS["trunk"]
+                ax.plot(xs, [p["s_spk" + suf] for p in ps], marker="o", ms=3, lw=2, color=color,
+                        label=f"same speaker, diff sentence ({t})" if tree else "same speaker, diff sentence")
+            trunk = [p for p in res["points"] if p["track"] == "trunk"]
+            xs = [p["depth"] for p in trunk]
+            ax.plot(xs, [p["s_txt" + suf] for p in trunk], ls="--", lw=1.6, color="#7c7b76",
+                    label="diff speaker, same sentence" + (" (trunk)" if tree else ""))
+            ax.plot(xs, [p["s_none" + suf] for p in trunk], ls=":", lw=1.6, color="#2b2b2b",
+                    label="diff speaker, diff sentence" + (" (trunk)" if tree else ""))
+            ax.axhline(0, color="k", lw=.6)
+            ax.set_title(f"{res['model']}  -  {'z-scored features' if not suf else 'raw features'}",
+                         fontsize=10)
+            ax.set_xlabel("depth (layers from the input embedding)")
+            ax.set_ylabel("mean cosine similarity")
+            ax.grid(alpha=.3)
+            ax.legend(fontsize=7, loc="best")
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    print(f"wrote {path}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -160,6 +195,7 @@ def main():
     tree = next((r for r in results if len(track_lines(r["points"])) > 1), None)
     if tree:
         plot_heads(plt, tree, cfg.out / "fig_heads.png")
+    plot_cosine(plt, results, cfg.out / "fig_cosine.png")
 
     # the two parts behind acoustic_share, side by side
     fig, axes = plt.subplots(1, 2, figsize=(15, 5))

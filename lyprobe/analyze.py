@@ -30,7 +30,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from lyprobe.common import (PROJECT_ROOT, RESULTS_DIR, SIBLING_BASELINES, complete_grid,  # noqa: E402
                             setup_project_cache)
-from lyprobe.metrics import probe_accuracy, similarity_index, variance_shares  # noqa: E402
+from lyprobe.metrics import cosine_profile, probe_accuracy, variance_shares  # noqa: E402
 
 
 # ---------------------------------------------------------------- loading
@@ -79,12 +79,17 @@ def evaluate(X, spk, sent, folds, seed, content_probe, probe):
     r = variance_shares(X, spk, sent)
     r["spk_acc"] = probe_accuracy(X, spk, sent, folds, seed=seed)[0] if probe else float("nan")
     r["sent_acc"] = probe_accuracy(X, sent, spk, folds, seed=seed)[0] if content_probe else float("nan")
-    r["spk_index"] = similarity_index(X, spk, sent)[2]
+    c = cosine_profile(X, spk, sent, standardize=True)
+    raw = cosine_profile(X, spk, sent, standardize=False)
+    r.update(c)
+    r.update({f"{k}_raw": v for k, v in raw.items()})
+    r["spk_index"] = c["s_spk"] - c["s_txt"]
     return r
 
 
 COLS = ["model", "point", "track", "depth", "acoustic_share", "eta_spk", "eta_sent",
-        "excess_spk", "excess_sent", "spk_acc", "sent_acc", "spk_index"]
+        "excess_spk", "excess_sent", "spk_acc", "sent_acc", "spk_index",
+        "s_spk", "s_txt", "s_none", "s_spk_raw", "s_txt_raw", "s_none_raw"]
 
 
 def main():

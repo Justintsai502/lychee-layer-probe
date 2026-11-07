@@ -17,7 +17,7 @@ from lyprobe.common import trim_silence  # noqa: E402
 from lyprobe.extract_lychee import point_table  # noqa: E402
 from lyprobe.layout import (TOK, compute_token_num, listening_suffix, mel_frames,  # noqa: E402
                             prepare_waveform, speech_slot_mask)
-from lyprobe.metrics import probe_accuracy, variance_shares  # noqa: E402
+from lyprobe.metrics import cosine_profile, probe_accuracy, variance_shares  # noqa: E402
 
 
 class LayoutTest(unittest.TestCase):
@@ -94,6 +94,15 @@ class VarianceSharesTest(unittest.TestCase):
         r = variance_shares(*self.grid(1.0, 1.0))
         self.assertLessEqual(r["eta_spk"] + r["eta_sent"], 1.0 + 1e-9)
         self.assertTrue(0.3 < r["acoustic_share"] < 0.7)
+
+    def test_cosine_profile_orders_pair_types(self):
+        X, spk, sent = self.grid(2.0, 0.0)              # voice only
+        c = cosine_profile(X, spk, sent)
+        self.assertGreater(c["s_spk"], c["s_none"] + 0.3)
+        self.assertLess(abs(c["s_txt"] - c["s_none"]), 0.05)
+        X, spk, sent = self.grid(0.0, 2.0)              # words only
+        c = cosine_profile(X, spk, sent)
+        self.assertGreater(c["s_txt"], c["s_spk"] + 0.3)
 
     def test_probe_ignores_content(self):
         X, spk, sent = self.grid(0.0, 3.0)

@@ -137,12 +137,27 @@ def probe_accuracy(X, y, groups, n_splits=5, inner_splits=3, seed=0):
 
 def similarity_index(X, speakers, sentences):
     """(s_spk, s_txt, s_spk - s_txt) on z-scored, L2-normalized features."""
-    Z = zscore(X)
+    c = cosine_profile(X, speakers, sentences, standardize=True)
+    return c["s_spk"], c["s_txt"], c["s_spk"] - c["s_txt"]
+
+
+def cosine_profile(X, speakers, sentences, standardize=True):
+    """Mean pairwise cosine for the three kinds of pairs on the speaker x sentence table.
+
+      s_spk   same speaker,      different sentence
+      s_txt   different speaker, same sentence
+      s_none  different speaker, different sentence   (the baseline: nothing shared)
+
+    standardize=True z-scores every dimension first. Raw LLM hidden states share one
+    dominant direction (anisotropy), so raw cosines sit near 1 for every pair and the
+    differences between pair types are compressed; the raw version is kept for reference.
+    """
+    Z = zscore(X) if standardize else np.asarray(X, dtype=np.float64).copy()
     Z /= np.linalg.norm(Z, axis=1, keepdims=True) + 1e-12
     C = Z @ Z.T
     spk, sent = np.asarray(speakers), np.asarray(sentences)
     same_spk = spk[:, None] == spk[None, :]
     same_sent = sent[:, None] == sent[None, :]
-    s_spk = float(C[same_spk & ~same_sent].mean())
-    s_txt = float(C[~same_spk & same_sent].mean())
-    return s_spk, s_txt, s_spk - s_txt
+    return {"s_spk": float(C[same_spk & ~same_sent].mean()),
+            "s_txt": float(C[~same_spk & same_sent].mean()),
+            "s_none": float(C[~same_spk & ~same_sent].mean())}
