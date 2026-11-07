@@ -124,35 +124,46 @@ def plot_heads(plt, res, path):
 
 
 def plot_cosine(plt, results, path):
-    """Mean cosine of same-speaker / different-sentence pairs per layer, with the two
-    reference pair types. Rows: z-scored features (main), raw features (reference)."""
+    """Row 1: mean cosine of the three pair types per layer (z-scored features).
+    Row 2: zoom on the same-speaker bonus, s_spk - s_none (how much more alike two clips
+    of one voice are than two unrelated clips). Raw-feature cosines stay in the JSON but
+    are not plotted: anisotropy puts every pair near 1 and s_spk on top of s_none."""
     if not all("s_spk" in r["points"][0] for r in results):
         print("result JSONs have no s_spk yet (re-run analysis on the server); skipped fig_cosine.png")
         return
-    fig, axes = plt.subplots(2, len(results), figsize=(8 * len(results), 9), squeeze=False)
+    fig, axes = plt.subplots(2, len(results), figsize=(8 * len(results), 9), squeeze=False,
+                             sharey="row")
+    base = {b["point"]: b for b in results[0].get("baselines", []) if "s_spk" in b}
     for col, res in enumerate(results):
         lines = track_lines(res["points"])
         tree = len(lines) > 1
-        for row, suf in enumerate(("", "_raw")):
-            ax = axes[row][col]
-            for t, ps in lines.items():
-                xs = [p["depth"] for p in ps]
-                color = TRACK_COLORS.get(t, OTHER_MODEL) if tree else TRACK_COLORS["trunk"]
-                ax.plot(xs, [p["s_spk" + suf] for p in ps], marker="o", ms=3, lw=2, color=color,
-                        label=f"same speaker, diff sentence ({t})" if tree else "same speaker, diff sentence")
-            trunk = [p for p in res["points"] if p["track"] == "trunk"]
-            xs = [p["depth"] for p in trunk]
-            ax.plot(xs, [p["s_txt" + suf] for p in trunk], ls="--", lw=1.6, color="#7c7b76",
-                    label="diff speaker, same sentence" + (" (trunk)" if tree else ""))
-            ax.plot(xs, [p["s_none" + suf] for p in trunk], ls=":", lw=1.6, color="#2b2b2b",
-                    label="diff speaker, diff sentence" + (" (trunk)" if tree else ""))
-            ax.axhline(0, color="k", lw=.6)
-            ax.set_title(f"{res['model']}  -  {'z-scored features' if not suf else 'raw features'}",
-                         fontsize=10)
-            ax.set_xlabel("depth (layers from the input embedding)")
-            ax.set_ylabel("mean cosine similarity")
-            ax.grid(alpha=.3)
-            ax.legend(fontsize=7, loc="best")
+        trunk = [p for p in res["points"] if p["track"] == "trunk"]
+        tx = [p["depth"] for p in trunk]
+        ax, bx = axes[0][col], axes[1][col]
+        for t, ps in lines.items():
+            xs = [p["depth"] for p in ps]
+            color = TRACK_COLORS.get(t, OTHER_MODEL) if tree else TRACK_COLORS["trunk"]
+            lab = f" ({t})" if tree else ""
+            ax.plot(xs, [p["s_spk"] for p in ps], marker="o", ms=3, lw=2, color=color,
+                    label="same speaker, diff sentence" + lab)
+            bx.plot(xs, [p["s_spk"] - p["s_none"] for p in ps], marker="o", ms=3, lw=2,
+                    color=color, label=t if tree else res["model"])
+        ax.plot(tx, [p["s_txt"] for p in trunk], ls="--", lw=1.6, color="#7c7b76",
+                label="diff speaker, same sentence" + (" (trunk)" if tree else ""))
+        ax.plot(tx, [p["s_none"] for p in trunk], ls=":", lw=1.6, color="#2b2b2b",
+                label="diff speaker, diff sentence" + (" (trunk)" if tree else ""))
+        ax.set_title(f"{res['model']}: mean cosine by pair type (z-scored features)", fontsize=10)
+        ref = "   ".join(f"{k} {v['s_spk'] - v['s_none']:.2f}" for k, v in base.items())
+        bx.set_title(f"{res['model']}: same-speaker bonus  s_spk - s_none\n"
+                     f"(reference, off scale: {ref})", fontsize=9)
+        for a in (ax, bx):
+            a.axhline(0, color="k", lw=.6)
+            a.set_xlabel("depth (layers from the input embedding)")
+            a.grid(alpha=.3)
+        ax.legend(fontsize=7, loc="center right")
+        bx.legend(fontsize=7, loc="upper right")
+    axes[0][0].set_ylabel("mean cosine similarity")
+    axes[1][0].set_ylabel("cosine gain over unrelated pairs")
     fig.tight_layout()
     fig.savefig(path, dpi=160)
     print(f"wrote {path}")

@@ -44,6 +44,31 @@ All three heads start from nearly the same point (acoustic share ~0.01) and sepa
 their own layers. This is the modality separation Lychee was designed for, visible in the
 representations.
 
+## 5. Cosine: same speaker, different sentence
+
+Mean cosine between utterance-mean vectors (z-scored per dimension), for three kinds of
+pairs: same speaker / different sentence (`s_spk`), different speaker / same sentence
+(`s_txt`), and different speaker / different sentence (`s_none`, nothing shared). The lower
+row zooms in on the same-speaker bonus `s_spk - s_none`.
+
+![cosine](fig_cosine.png)
+
+- **The same sentence matters far more than the same voice.** Two different people saying
+  the same sentence reach cosine 0.75-0.87 in the middle layers. One person saying two
+  different sentences stays at about -0.02, almost the same as two unrelated clips (-0.03).
+- **The voice bonus peaks early and then collapses.** Lychee trunk_1 gives +0.108 and
+  BayLing layer 2 gives +0.136. By layer 4 Lychee is at +0.019, and BayLing reaches the
+  same level by layer 9. After that both stay near +0.01.
+- **The heads in Lychee:** control rises to +0.025 and speech_4 to +0.038, then merge drops
+  back to +0.022. BayLing's last layers climb slightly, to +0.036 at layer 40.
+- **For reference:** ECAPA gives +0.55 and Mimi CB2-8 +0.35. The best LLM layer reaches
+  about a quarter of Mimi's acoustic codebooks.
+- **Agreement with the other metrics:** the cosine view gives the same layer ranking as
+  acoustic share and the probe, with the same peaks (Lychee 1, BayLing 2-4).
+- **Raw-feature cosines** are kept in the JSON (`*_raw`) but not plotted. Raw hidden
+  states share one dominant direction, so every pair sits at 0.75-1.0 and `s_spk` lies on
+  top of `s_none`.
+
 ## Key numbers
 
 | point | depth | acoustic share | voice var. | content var. | speaker probe |
