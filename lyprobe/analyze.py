@@ -158,6 +158,7 @@ def write_json(path, rows, model, features, n, n_spk, n_sent):
         "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "n_clips": n, "n_speakers": n_spk, "n_sentences": n_sent,
         "chance_speaker_probe": 1 / n_spk,
+        "acoustic_share_method": "omega2: chance floor from residual variance (k - 1) * ms_resid",
         "points": [{k: clean(r[k]) for k in COLS if k != "model"}
                    for r in rows if r["track"] != "baseline"],
         "baselines": [{k: clean(r[k]) for k in COLS if k not in ("model", "track", "depth")}

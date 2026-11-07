@@ -31,17 +31,22 @@ def variance_shares(X, speakers, sentences):
         eta_sent = sum_t n_t |mean_t|^2 / sum_i |x_i|^2
 
     On a balanced table these two and the residual (interaction + noise) add up to 1.
-    Pure noise still explains (k - 1) / (N - 1) through k group means, so that floor
-    is subtracted:
+    Group means pick up some noise even without any real effect, so that floor is
+    removed omega^2-style, from the RESIDUAL variance:
 
-        excess   = max(eta - (k - 1) / (N - 1), 0)
+        ms_resid = (1 - eta_spk - eta_sent) / (N - k_spk - k_sent + 1)
+        excess_spk = max(eta_spk - (k_spk - 1) * ms_resid, 0)          (same for sentence)
         acoustic_share = excess_spk / (excess_spk + excess_sent)   in [0, 1]
+
+    The floor must come from the residual, not from the total: every speaker reads
+    every sentence, so the sentence effect cancels inside speaker means, and when the
+    sentence explains 80 % of the variance the chance level for speaker is 5x smaller
+    than (k - 1) / (N - 1). Using the total clipped real speaker variance to 0.
 
     1 = everything the layer encodes about these clips is the voice, 0 = it is the words.
     """
     Z = zscore(X)
     spk, sent = np.asarray(speakers), np.asarray(sentences)
-    n = len(Z)
     total = float((Z ** 2).sum())
 
     def explained(labels):
@@ -51,9 +56,16 @@ def variance_shares(X, speakers, sentences):
             ss += m.sum() * float((Z[m].mean(0) ** 2).sum())
         return ss / total
 
-    eta_spk, eta_sent = explained(spk), explained(sent)
-    k_spk, k_sent = len(np.unique(spk)), len(np.unique(sent))
-    null_spk, null_sent = (k_spk - 1) / (n - 1), (k_sent - 1) / (n - 1)
+    out = shares_from_eta(explained(spk), explained(sent), len(Z),
+                          len(np.unique(spk)), len(np.unique(sent)))
+    return out
+
+
+def shares_from_eta(eta_spk, eta_sent, n, k_spk, k_sent):
+    """Excess shares and acoustic_share from the two eta values of a balanced table."""
+    df_resid = max(n - k_spk - k_sent + 1, 1)
+    ms_resid = max(1.0 - eta_spk - eta_sent, 0.0) / df_resid
+    null_spk, null_sent = (k_spk - 1) * ms_resid, (k_sent - 1) * ms_resid
     ex_spk, ex_sent = max(eta_spk - null_spk, 0.0), max(eta_sent - null_sent, 0.0)
     denom = ex_spk + ex_sent
     return {

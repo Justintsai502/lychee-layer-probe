@@ -107,6 +107,18 @@ def main():
         plt.close(fig)
         print(f"wrote {cfg.out / fname}")
 
+    # the two parts behind acoustic_share, side by side
+    fig, axes = plt.subplots(1, 2, figsize=(15, 5))
+    for ax, key, ylabel in ((axes[0], "excess_spk", "voice: variance explained by speaker"),
+                            (axes[1], "excess_sent", "content: variance explained by sentence")):
+        draw(ax, results, key, ylabel)
+        ax.set_ylim(0, 1.0 if key == "excess_sent" else None)
+    fig.suptitle("Above-chance share of each layer's variance (omega^2)", fontsize=11)
+    fig.tight_layout()
+    fig.savefig(cfg.out / "fig_variance.png", dpi=160)
+    plt.close(fig)
+    print(f"wrote {cfg.out / 'fig_variance.png'}")
+
 
 if __name__ == "__main__":
     sys.exit(main())

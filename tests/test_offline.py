@@ -80,6 +80,16 @@ class VarianceSharesTest(unittest.TestCase):
         self.assertGreater(variance_shares(*self.grid(2.0, 0.0))["acoustic_share"], 0.9)
         self.assertLess(variance_shares(*self.grid(0.0, 2.0))["acoustic_share"], 0.1)
 
+    def test_weak_voice_under_strong_content_is_not_clipped(self):
+        # the bug the real Lychee run exposed: sentence explains most of the variance,
+        # a real but small speaker effect must still come out above zero
+        r = variance_shares(*self.grid(0.4, 3.0, n_spk=25, n_sent=30, dim=64))
+        self.assertGreater(r["excess_spk"], 0.0)
+        self.assertTrue(0.0 < r["acoustic_share"] < 0.2)
+        # and pure noise added to the same strong content still gives ~0 voice
+        r0 = variance_shares(*self.grid(0.0, 3.0, n_spk=25, n_sent=30, dim=64))
+        self.assertLess(r0["acoustic_share"], 0.005)
+
     def test_shares_add_up_to_at_most_one(self):
         r = variance_shares(*self.grid(1.0, 1.0))
         self.assertLessEqual(r["eta_spk"] + r["eta_sent"], 1.0 + 1e-9)
