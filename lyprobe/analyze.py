@@ -117,6 +117,14 @@ def main():
     F, spk, sent, base, spk_set, sent_set = align(feat, baselines)
     print(f"{feat['model']}: {len(spk)} clips | {len(spk_set)} speakers x {len(sent_set)} sentences "
           f"| {F.shape[1]} points")
+    degenerate = len(spk_set) < 3 or len(sent_set) < 3
+    if degenerate:
+        # 1 speaker: the probe is trivially 1.0 and there is no speaker variance, so
+        # acoustic_share is 0/0 rounded by float noise. Fine for checking the pipeline only.
+        print("WARNING: fewer than 3 speakers or sentences - every number below is meaningless "
+              "(pipeline check only); the result JSON is not written to results/")
+        if cfg.json.parent.resolve() == RESULTS_DIR.resolve():
+            cfg.json = PROJECT_ROOT / "work/results" / f"{name}_DEGENERATE.json"
 
     rows = []
     for p, (name, depth, track) in enumerate(zip(feat["names"], feat["depths"], feat["tracks"])):
@@ -138,7 +146,8 @@ def main():
     plot(cfg.out / "curves.png", rows, feat["model"], len(spk_set))
     write_json(cfg.json, rows, feat["model"], cfg.features, len(spk), len(spk_set), len(sent_set))
     print(f"wrote {cfg.out}/metrics.csv, summary.md")
-    print(f"wrote {cfg.json}  <- commit and push this")
+    tracked = cfg.json.parent.resolve() == RESULTS_DIR.resolve()
+    print(f"wrote {cfg.json}" + ("  <- commit and push this" if tracked else "  (not for pushing)"))
 
 
 def write_json(path, rows, model, features, n, n_spk, n_sent):

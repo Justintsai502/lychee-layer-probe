@@ -25,8 +25,10 @@ limit=()
 echo "== 1/3 Lychee hidden states"
 $PY -u lyprobe/extract_lychee.py ${limit[@]+"${limit[@]}"}
 
-echo "== 2/3 Analysis: Lychee  -> results/lychee.json"
-$PY -u lyprobe/analyze.py --features work/features/lychee.npz
+echo "== 2/3 Analysis: Lychee  -> results/lychee.json (smoke: work/results/smoke.json)"
+json_args=()
+[[ "${SMOKE:-0}" == "1" ]] && json_args=(--json work/results/smoke.json)
+$PY -u lyprobe/analyze.py --features work/features/lychee.npz ${json_args[@]+"${json_args[@]}"}
 
 if [[ -f "$SIB/features/bayling_silence.npz" && "${SMOKE:-0}" != "1" ]]; then
   echo "== 3/3 Analysis: BayLing with the same metric  -> results/bayling.json"
