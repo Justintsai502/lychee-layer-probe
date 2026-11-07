@@ -1,0 +1,7 @@
+work/
+cache/
+models/
+third_party/
+__pycache__/
+*.npz
+*.log

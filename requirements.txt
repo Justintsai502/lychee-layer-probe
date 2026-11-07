@@ -1,0 +1,12 @@
+# Lychee-FD's own pins (HITsz-TMG/Lychee-FD requirements.txt): torch 2.5.1, transformers 4.57.6.
+# The `spkprobe` env from bayling-speaker-probe (transformers 4.57.3) has everything below.
+torch
+torchaudio            # imported by LycheeFD.py
+transformers>=4.57,<5 # LycheeFD.py imports transformers.masking_utils / layer_type_validation
+accelerate
+safetensors
+librosa               # Lychee's mel filterbank
+soundfile
+scipy
+numpy
+matplotlib
