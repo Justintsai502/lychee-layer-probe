@@ -6,6 +6,8 @@ Layer metrics on a complete speaker x sentence table (numpy only).
                     and gives the acoustic : semantic ratio directly.
   probe_accuracy    grouped-CV ridge classifier (can the label be read out?)
   similarity_index  s_spk - s_txt on the whole space (which factor organizes it?)
+  eer_cosine        speaker-verification EER, cosine on z-scored features, no training
+  eer_wccn          speaker-verification EER on unseen speakers with a WCCN backend
 """
 
 import numpy as np
@@ -161,3 +163,96 @@ def cosine_profile(X, speakers, sentences, standardize=True):
     return {"s_spk": float(C[same_spk & ~same_sent].mean()),
             "s_txt": float(C[~same_spk & same_sent].mean()),
             "s_none": float(C[~same_spk & ~same_sent].mean())}
+
+
+# ---------------------------------------------------------------- speaker verification EER
+
+def eer(target_scores, nontarget_scores):
+    """Equal error rate: the threshold where false accepts = false rejects. 0 = perfect,
+    0.5 = chance. Can exceed 0.5 when non-target pairs score HIGHER than target pairs."""
+    t = np.asarray(target_scores, dtype=np.float64)
+    n = np.asarray(nontarget_scores, dtype=np.float64)
+    if len(t) == 0 or len(n) == 0:
+        return float("nan")
+    s = np.concatenate([t, n])
+    y = np.concatenate([np.ones(len(t)), np.zeros(len(n))])
+    order = np.argsort(-s, kind="mergesort")
+    y = y[order]
+    # threshold just below the k-th highest score: accept the top k
+    frr = np.concatenate([[1.0], 1.0 - np.cumsum(y) / len(t)])
+    far = np.concatenate([[0.0], np.cumsum(1 - y) / len(n)])
+    k = int(np.argmin(np.abs(frr - far)))
+    # interpolate between the two thresholds around the crossing
+    if k + 1 < len(frr) and (frr[k] - far[k]) * (frr[k + 1] - far[k + 1]) < 0:
+        a, b = frr[k] - far[k], frr[k + 1] - far[k + 1]
+        w = a / (a - b)
+        return float(far[k] + w * (far[k + 1] - far[k]))
+    return float((frr[k] + far[k]) / 2)
+
+
+def trial_masks(spk, sent):
+    """Upper-triangle pair masks: target (same speaker, different sentence), nontarget
+    (different speaker, different sentence) and hard nontarget (different speaker, SAME
+    sentence). Same-speaker same-sentence pairs do not exist (one take per cell)."""
+    spk, sent = np.asarray(spk), np.asarray(sent)
+    same_spk = spk[:, None] == spk[None, :]
+    same_sent = sent[:, None] == sent[None, :]
+    upper = np.triu(np.ones(same_spk.shape, bool), k=1)
+    return upper & same_spk & ~same_sent, upper & ~same_spk & ~same_sent, upper & ~same_spk & same_sent
+
+
+def _unit(Z):
+    return Z / (np.linalg.norm(Z, axis=1, keepdims=True) + 1e-12)
+
+
+def eer_cosine(X, spk, sent):
+    """Training-free EER: cosine on z-scored features (statistics from all clips, no
+    labels). Returns (eer, eer_hard)."""
+    Z = _unit(zscore(X))
+    C = Z @ Z.T
+    tgt, non, hard = trial_masks(spk, sent)
+    return eer(C[tgt], C[non]), eer(C[tgt], C[hard])
+
+
+def wccn_fit(X, y, pca_dim=200, reg=1e-3):
+    """PCA (on z-scored X) then within-class covariance normalization (WCCN): whiten the
+    variation INSIDE each speaker (different sentences, noise), keep every direction.
+
+    Chosen over LDA: LDA keeps only the (n_train_speakers - 1) = 19 directions that
+    separate the training speakers, and new speakers fall partly outside that span
+    (on synthetic voice-only data LDA gives EER 0.12 where cosine gives 0.02; WCCN 0.02).
+    Returns a projector function."""
+    mu, sd = X.mean(0), X.std(0) + 1e-6
+    Z = (X - mu) / sd
+    k = max(1, min(pca_dim, Z.shape[0] - 1, Z.shape[1]))
+    _, _, Vt = np.linalg.svd(Z, full_matrices=False)
+    P = Vt[:k].T
+    Y = Z @ P
+    Sw = np.zeros((k, k))
+    for c in np.unique(y):
+        D = Y[y == c] - Y[y == c].mean(0)
+        Sw += D.T @ D
+    Sw += reg * np.trace(Sw) / k * np.eye(k)
+    ev, V = np.linalg.eigh(Sw)
+    A = P @ (V / np.sqrt(np.clip(ev, 1e-12, None)))
+    return lambda Xn: ((Xn - mu) / sd) @ A
+
+
+def eer_wccn(X, spk, sent, n_splits=5, pca_dim=200, seed=0):
+    """EER on UNSEEN speakers: WCCN backend trained on the other speakers' clips
+    (speaker-disjoint folds, 20 train / 5 test speakers), cosine scoring of trials among
+    the held-out speakers, scores pooled over folds. Returns (eer, eer_hard)."""
+    X = np.asarray(X, dtype=np.float64)
+    spk, sent = np.asarray(spk), np.asarray(sent)
+    if len(np.unique(spk)) < 4:
+        return float("nan"), float("nan")
+    T, N, H = [], [], []
+    for tr, te in group_folds(spk, n_splits, seed):
+        Z = _unit(wccn_fit(X[tr], spk[tr], pca_dim)(X[te]))
+        C = Z @ Z.T
+        tgt, non, hard = trial_masks(spk[te], sent[te])
+        T.append(C[tgt])
+        N.append(C[non])
+        H.append(C[hard])
+    T, N, H = np.concatenate(T), np.concatenate(N), np.concatenate(H)
+    return eer(T, N), eer(T, H)

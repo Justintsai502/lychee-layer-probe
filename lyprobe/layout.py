@@ -87,3 +87,16 @@ def speech_slot_mask(n_slots, lead_s, speech_s, slot_s=SLOT_S, min_overlap=0.5):
     end = start + slot_s
     overlap = np.clip(np.minimum(end, lead_s + speech_s) - np.maximum(start, lead_s), 0, None)
     return overlap >= min_overlap * slot_s
+
+
+def window_frame_mask(n_windows, frames_per_window, frame_s, lead_s, speech_s,
+                      window_s=CHUNK_S, min_overlap=0.5):
+    """Encoder frames inside independently encoded windows -> [n_windows, frames] mask.
+
+    Frame j of window i covers [i * window_s + j * frame_s, + frame_s). True where that
+    span overlaps the speech by >= min_overlap of a frame.
+    """
+    start = (np.arange(n_windows)[:, None] * window_s + np.arange(frames_per_window)[None, :] * frame_s)
+    end = start + frame_s
+    overlap = np.clip(np.minimum(end, lead_s + speech_s) - np.maximum(start, lead_s), 0, None)
+    return overlap >= min_overlap * frame_s - 1e-9

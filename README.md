@@ -150,3 +150,43 @@ The tests check:
 - **The listening state is fixed.** Every clip is fed in the listening state. While
   listening, the speech and merge branches only ever see `stoken_pad`, so they are measured
   outside their speaking regime.
+
+## EER version, audio encoder included
+
+Every point is scored by **speaker-verification EER** (equal error rate; 0 = perfect, 0.5 =
+chance), and the layers of each model's **audio encoder**, the part before the LLM, are
+measured too.
+
+**Audio encoder points** (depth < 0; the LLM input embedding is depth 0):
+
+| | encoder | points |
+|---|---|---|
+| Lychee-FD | Step-Audio-2 Whisper encoder, every 0.4 s window encoded on its own | `enc_0` (conv + positions), `enc_1…32` (blocks), `enc_pool` (AvgPool 2 + LayerNorm), `adaptor` (the vector added to the `<audio_patch>` slots) |
+| BayLing-Duplex | GLM-4-Voice speech tokenizer (WhisperVQEncoder: 16 layers, AvgPool 4, VQ with 16384 codes) | `enc_0`, `enc_1…16`, `vq` (the codebook vector of the token the LLM reads) |
+
+Layer counts are read from the loaded model, not hard-coded.
+
+**Trials** on the 25 × 30 grid:
+- **Targets:** same speaker, different sentence (10,875 pairs).
+- **Impostors:** different speaker, different sentence (261,000 pairs).
+
+| metric | meaning |
+|---|---|
+| `eer_cos` | cosine on z-scored features, no training |
+| `eer_wccn` | PCA 200 + WCCN (within-speaker whitening) trained on 20 speakers, scored on 5 unseen speakers; 5 speaker-disjoint folds, scores pooled |
+| `eer_*_hard` | impostors are different speakers saying the **same** sentence; above 0.5 means the layer matches words more than voices |
+
+WCCN is used instead of LDA. With 20 training speakers, LDA keeps only 19 directions, and
+new speakers fall partly outside them: on synthetic voice-only data LDA gives EER 0.12
+where cosine and WCCN give 0.02.
+
+**On the server** (GPU node, same environment as before). The LLM features from the
+earlier runs are reused, so only the two encoders run:
+
+```bash
+cd /work/b12901015/lychee-layer-probe && git pull
+SMOKE=1 bash scripts/run_eer.sh        # 6 clips, pipeline check
+PUSH=1 bash scripts/run_eer.sh         # full run, pushes results/*_eer.json
+```
+
+Locally: `python lyprobe/plot_eer.py` writes `docs/fig_eer.png`.

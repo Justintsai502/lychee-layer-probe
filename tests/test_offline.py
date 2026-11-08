@@ -12,12 +12,15 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from lyprobe import analyze, fake_features  # noqa: E402
+from lyprobe import analyze, analyze_eer, fake_features  # noqa: E402
 from lyprobe.common import trim_silence  # noqa: E402
 from lyprobe.extract_lychee import point_table  # noqa: E402
+from lyprobe.extract_bayling_encoder import prepare_waveform_bayling  # noqa: E402
+from lyprobe.extract_lychee_encoder import save_points  # noqa: E402
 from lyprobe.layout import (TOK, compute_token_num, listening_suffix, mel_frames,  # noqa: E402
-                            prepare_waveform, speech_slot_mask)
-from lyprobe.metrics import cosine_profile, probe_accuracy, variance_shares  # noqa: E402
+                            prepare_waveform, speech_slot_mask, window_frame_mask)
+from lyprobe.metrics import (cosine_profile, eer, eer_cosine, eer_wccn, probe_accuracy,  # noqa: E402
+                             trial_masks, variance_shares)
 
 
 class LayoutTest(unittest.TestCase):
@@ -127,6 +130,80 @@ class EndToEndTest(unittest.TestCase):
             res = json.loads((d / "res.json").read_text())
             self.assertEqual(len(res["points"]), 41)
             self.assertEqual(res["n_speakers"], 8)
+
+
+class EERTest(unittest.TestCase):
+    def grid(self, a, b, n_spk=25, n_sent=30, dim=64, seed=0):
+        return VarianceSharesTest.grid(None, a, b, seed, n_spk, n_sent, dim)
+
+    def test_eer_extremes(self):
+        self.assertEqual(eer([2, 3], [0, 1]), 0.0)
+        self.assertEqual(eer([0, 1], [2, 3]), 1.0)
+        rng = np.random.default_rng(0)
+        self.assertAlmostEqual(eer(rng.normal(1, 1, 20000), rng.normal(0, 1, 200000)), 0.3085, delta=0.01)
+        self.assertTrue(np.isnan(eer([], [1.0])))
+
+    def test_trial_counts(self):
+        _, spk, sent = self.grid(0, 0)
+        t, n, h = trial_masks(spk, sent)
+        self.assertEqual((t.sum(), n.sum(), h.sum()), (25 * 435, 750 * 696 // 2, 30 * 300))
+
+    def test_voice_gives_low_eer_words_give_chance(self):
+        X, spk, sent = self.grid(1.0, 0.0)
+        self.assertLess(eer_cosine(X, spk, sent)[0], 0.05)
+        self.assertLess(eer_wccn(X, spk, sent)[0], 0.05)
+        X, spk, sent = self.grid(0.0, 2.0)
+        self.assertAlmostEqual(eer_cosine(X, spk, sent)[0], 0.5, delta=0.03)
+        self.assertGreater(eer_cosine(X, spk, sent)[1], 0.9)      # hard impostors win
+
+    def test_wccn_recovers_voice_under_content(self):
+        X, spk, sent = self.grid(0.5, 3.0)
+        self.assertLess(eer_wccn(X, spk, sent)[0], eer_cosine(X, spk, sent)[0] - 0.1)
+
+
+class EncoderLayoutTest(unittest.TestCase):
+    def test_lychee_window_frames(self):
+        # lead 4 chunks (1.6 s) + 0.4 s speech: only window 4 is speech, all 20 frames
+        m = window_frame_mask(6, 20, 0.02, 1.6, 0.4)
+        self.assertEqual(m.sum(), 20)
+        self.assertTrue(m[4].all())
+        self.assertEqual(window_frame_mask(6, 5, 0.08, 1.6, 0.4).sum(), 5)
+
+    def test_bayling_waveform(self):
+        sr = 16000
+        x = np.zeros(sr * 2, np.float32)
+        x[sr // 2:sr] = 0.5 * np.sin(np.arange(sr // 2) * 0.05)
+        wave, lead_s, speech_s = prepare_waveform_bayling(x, sr, 2)
+        self.assertAlmostEqual(lead_s, 1.6)
+        self.assertEqual(len(wave) % int(0.8 * sr), 0)
+
+
+class EEREndToEndTest(unittest.TestCase):
+    def test_encoder_plus_llm(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            sys.argv = ["fake_features", "--out", str(d)]
+            fake_features.main()
+            llm = np.load(d / "lychee_fake.npz")
+            rng = np.random.default_rng(1)
+            spk_ids = {s: i for i, s in enumerate(sorted(set(llm["speaker"].tolist())))}
+            voice = rng.normal(size=(len(spk_ids), 32))
+            feats = []
+            for s in llm["speaker"]:
+                v = voice[spk_ids[s]]
+                feats.append([v + rng.normal(size=32) * 0.3, v + rng.normal(size=32) * 3.0])
+            rows = list(zip(llm["utt_id"], llm["speaker"], llm["sentence_id"]))
+            save_points(d / "enc.npz", ["enc_0", "enc_1"], [-2, -1], "encoder", feats, rows, {})
+            out = d / "eer.json"
+            sys.argv = ["analyze_eer", "--llm", str(d / "lychee_fake.npz"), "--encoder", str(d / "enc.npz"),
+                        "--baselines", str(d / "none.npz"), "--json", str(out), "--folds", "4"]
+            analyze_eer.main()
+            res = json.loads(out.read_text())
+            by = {p["point"]: p for p in res["points"]}
+            self.assertEqual(len(res["points"]), 43)
+            self.assertEqual(by["enc_0"]["depth"], -2)
+            self.assertLess(by["enc_0"]["eer_cos"], by["enc_1"]["eer_cos"])
+            self.assertLess(by["enc_0"]["eer_cos"], 0.1)
 
 
 if __name__ == "__main__":
