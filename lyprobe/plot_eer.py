@@ -52,7 +52,7 @@ def main():
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, axes = plt.subplots(1, len(results), figsize=(9 * len(results), 5.2), squeeze=False,
+    fig, axes = plt.subplots(1, len(results), figsize=(9 * len(results), 6.0), squeeze=False,
                              sharey=True)
     for ax, res in zip(axes[0], results):
         lines = lines_with_encoder(res["points"])
@@ -66,20 +66,21 @@ def main():
         for b in res.get("baselines", []):
             col = BASE_STYLE.get(b["point"], "#9a998f")
             ax.axhline(100 * b["eer_cos"], color=col, ls=":", lw=1)
-            ax.annotate(f"{b['point']} {100 * b['eer_cos']:.1f}%", (ax.get_xlim()[0], 100 * b["eer_cos"]),
-                        fontsize=7, color=col, va="bottom")
+            ax.annotate(f"{b['point']} {100 * b['eer_cos']:.1f}%", (0.995, 100 * b["eer_cos"]),
+                        xycoords=("axes fraction", "data"), fontsize=7, color=col, ha="right",
+                        va="top" if b["point"] == "mimi_acoustic" else "bottom")
         ax.axhline(50, color="k", lw=.8)
-        ax.annotate("chance 50%", (0, 50), fontsize=8, va="bottom")
+        ax.annotate("chance 50%", (0.005, 50), xycoords=("axes fraction", "data"), fontsize=8, va="bottom")
         if "encoder" in lines:
             ax.axvline(-0.5, color=COLORS["encoder"], lw=.8, alpha=.5)
-            ax.annotate("audio encoder | LLM", (-0.5, 2), fontsize=8, ha="center",
+            ax.annotate("audio encoder  |  LLM", (-0.5, 55), fontsize=8, ha="center",
                         color=COLORS["encoder"])
         ax.set_title(f"{res['model']}: speaker-verification EER per layer "
                      f"({res['n_speakers']} spk x {res['n_sentences']} sent)", fontsize=10)
         ax.set_xlabel("depth (negative = audio encoder, 0 = LLM input)")
         ax.set_ylim(0, 60)
         ax.grid(alpha=.3)
-        ax.legend(fontsize=7, loc="lower right", ncol=2)
+        ax.legend(fontsize=7, loc="upper center", bbox_to_anchor=(0.5, -0.13), ncol=5, frameon=False)
     axes[0][0].set_ylabel("EER %   (lower = more speaker information)")
     fig.tight_layout()
     cfg.out.parent.mkdir(parents=True, exist_ok=True)
