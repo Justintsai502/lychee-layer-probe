@@ -22,7 +22,7 @@ are joined by utt_id, and every point is scored on the same clips.
 
 Output: results/<name>_eer.json, work/results/<name>_eer.csv
 
-Hard deps: numpy
+Hard deps: numpy   (optional: torch + CUDA, used automatically for speed)
 """
 
 import argparse
@@ -80,9 +80,30 @@ def take(X, utt_ids, utts):
     return np.asarray(X)[np.array([pos[u] for u in utts])].astype(np.float32)
 
 
-def score(X, spk, sent, folds, pca, seed):
-    c, ch = eer_cosine(X, spk, sent)
-    w, wh = eer_wccn(X, spk, sent, folds, pca, seed)
+def pick_device(name):
+    """'auto' -> 'cuda' when torch sees a GPU, else None (numpy on CPU)."""
+    if name == "cpu":
+        return None
+    try:
+        import torch
+        ok = torch.cuda.is_available()
+    except ImportError:
+        ok = False
+    if name == "auto":
+        return "cuda" if ok else None
+    if name.startswith("cuda") and not ok:
+        raise SystemExit("--device cuda but torch sees no GPU")
+    return name
+
+
+def score(X, spk, sent, folds, pca, seed, device=None):
+    if device is None:
+        c, ch = eer_cosine(X, spk, sent)
+        w, wh = eer_wccn(X, spk, sent, folds, pca, seed)
+    else:
+        from lyprobe import metrics_torch as mt
+        c, ch = mt.eer_cosine(X, spk, sent, device)
+        w, wh = mt.eer_wccn(X, spk, sent, folds, pca, seed, device)
     return {"eer_cos": c, "eer_wccn": w, "eer_cos_hard": ch, "eer_wccn_hard": wh}
 
 
@@ -100,7 +121,11 @@ def main():
     ap.add_argument("--folds", type=int, default=5, help="speaker-disjoint folds for eer_wccn")
     ap.add_argument("--pca", type=int, default=200, help="PCA dims before WCCN")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--device", default="auto",
+                    help="auto (GPU if torch sees one), cuda, or cpu (numpy). Same numbers either way")
     cfg = ap.parse_args()
+    device = pick_device(cfg.device)
+    print(f"scoring on {device or 'cpu (numpy)'}")
 
     for p in (cfg.llm, cfg.encoder):
         if p is not None and not p.exists():
@@ -127,14 +152,14 @@ def main():
     t0 = time.time()
     for i, (n, dp, t, X, u) in enumerate(pts):
         Xg = take(X, u, utts)
-        r = score(Xg, spk, sent, cfg.folds, cfg.pca, cfg.seed)
+        r = score(Xg, spk, sent, cfg.folds, cfg.pca, cfg.seed, device)
         rows.append(dict(model=llm["model"], point=n, track=t, depth=dp, dim=int(Xg.shape[1]), **r))
         print(f"  {n:>11} d={dp:>4}  eer_cos {r['eer_cos']:.3f}  eer_wccn {r['eer_wccn']:.3f}  "
               f"hard {r['eer_cos_hard']:.3f}/{r['eer_wccn_hard']:.3f}  [{i + 1}/{len(pts)}, "
               f"{time.time() - t0:.0f}s]", flush=True)
     base_rows = []
     for bn, (F, u) in baselines.items():
-        r = score(take(F, u, utts), spk, sent, cfg.folds, cfg.pca, cfg.seed)
+        r = score(take(F, u, utts), spk, sent, cfg.folds, cfg.pca, cfg.seed, device)
         base_rows.append(dict(point=bn, dim=int(F.shape[1]), **r))
         print(f"  {bn:>11}  eer_cos {r['eer_cos']:.3f}  eer_wccn {r['eer_wccn']:.3f}")
 

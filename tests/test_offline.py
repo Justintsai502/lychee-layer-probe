@@ -161,6 +161,19 @@ class EERTest(unittest.TestCase):
         self.assertLess(eer_wccn(X, spk, sent)[0], eer_cosine(X, spk, sent)[0] - 0.1)
 
 
+class TorchEERTest(unittest.TestCase):
+    def test_torch_matches_numpy(self):
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch not installed")
+        from lyprobe import metrics_torch as mt
+        X, spk, sent = EERTest.grid(None, 0.5, 2.0, dim=300)
+        ref = eer_cosine(X, spk, sent) + eer_wccn(X, spk, sent)
+        got = mt.eer_cosine(X, spk, sent, "cpu") + mt.eer_wccn(X, spk, sent, device="cpu")
+        np.testing.assert_allclose(got, ref, atol=1e-9)
+
+
 class EncoderLayoutTest(unittest.TestCase):
     def test_lychee_window_frames(self):
         # lead 4 chunks (1.6 s) + 0.4 s speech: only window 4 is speech, all 20 frames
