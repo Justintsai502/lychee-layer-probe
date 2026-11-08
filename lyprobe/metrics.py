@@ -225,8 +225,14 @@ def wccn_fit(X, y, pca_dim=200, reg=1e-3):
     mu, sd = X.mean(0), X.std(0) + 1e-6
     Z = (X - mu) / sd
     k = max(1, min(pca_dim, Z.shape[0] - 1, Z.shape[1]))
-    _, _, Vt = np.linalg.svd(Z, full_matrices=False)
-    P = Vt[:k].T
+    if Z.shape[1] > Z.shape[0]:
+        # n << D (600 clips x 3584 dims): PCA from the n x n Gram matrix, same result as
+        # the SVD but one matrix product + a small eigh instead of a 600 x 3584 SVD
+        s, U = np.linalg.eigh(Z @ Z.T)
+        s, U = s[::-1][:k], U[:, ::-1][:, :k]
+        P = (Z.T @ U) / np.sqrt(np.clip(s, 1e-12, None))
+    else:
+        P = np.linalg.svd(Z, full_matrices=False)[2][:k].T
     Y = Z @ P
     Sw = np.zeros((k, k))
     for c in np.unique(y):

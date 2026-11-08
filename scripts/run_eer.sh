@@ -4,6 +4,7 @@
 #   bash scripts/run_eer.sh           # extract both encoders, then EER for Lychee + BayLing
 #   SMOKE=1 bash scripts/run_eer.sh   # first 6 clips only (pipeline check, nothing pushed)
 #   PUSH=1 bash scripts/run_eer.sh    # also commit + push results/*_eer.json
+#   FORCE=1 ...                       # re-extract encoder features even if they exist
 #
 # Needs the LLM features from the earlier runs (not recomputed):
 #   work/features/lychee.npz                                     (scripts/run_server.sh)
@@ -16,6 +17,10 @@ mkdir -p work/logs
 exec > >(tee -a work/logs/run_eer.log) 2>&1
 
 PY=${PY:-python}
+# numpy/BLAS: one thread per CPU we actually have. Without this OpenBLAS starts one thread
+# per core of the whole node, and on a Slurm allocation with a few CPUs the analysis crawls.
+NCPU=${SLURM_CPUS_PER_TASK:-$(nproc)}
+export OMP_NUM_THREADS=$NCPU OPENBLAS_NUM_THREADS=$NCPU MKL_NUM_THREADS=$NCPU
 SIB=../bayling-speaker-probe/work
 SMOKE=${SMOKE:-0}
 
@@ -27,11 +32,14 @@ BL_ENC=work/features/bayling_encoder${suffix}.npz
 [[ -f third_party/lychee_fd_model/LycheeFD.py ]] || bash scripts/fetch_lychee_code.sh
 [[ -f work/features/lychee.npz ]] || { echo "work/features/lychee.npz missing: run scripts/run_server.sh first"; exit 1; }
 
-echo "== 1/4 Lychee audio encoder (GPU)"
-$PY -u lyprobe/extract_lychee_encoder.py ${limit[@]+"${limit[@]}"} --out "$LY_ENC"
+# encoder features are kept: a rerun only redoes the analysis (FORCE=1 re-extracts)
+if [[ -f "$LY_ENC" && "${FORCE:-0}" != "1" ]]; then echo "== 1/4 skip: $LY_ENC exists"
+else echo "== 1/4 Lychee audio encoder (GPU)"
+  $PY -u lyprobe/extract_lychee_encoder.py ${limit[@]+"${limit[@]}"} --out "$LY_ENC"; fi
 
-echo "== 2/4 BayLing speech tokenizer encoder (GPU, small)"
-$PY -u lyprobe/extract_bayling_encoder.py ${limit[@]+"${limit[@]}"} --out "$BL_ENC"
+if [[ -f "$BL_ENC" && "${FORCE:-0}" != "1" ]]; then echo "== 2/4 skip: $BL_ENC exists"
+else echo "== 2/4 BayLing speech tokenizer encoder (GPU, small)"
+  $PY -u lyprobe/extract_bayling_encoder.py ${limit[@]+"${limit[@]}"} --out "$BL_ENC"; fi
 
 json_ly=() ; json_bl=()
 if [[ "$SMOKE" == "1" ]]; then

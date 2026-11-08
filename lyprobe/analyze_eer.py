@@ -29,6 +29,7 @@ import argparse
 import csv
 import json
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -123,12 +124,14 @@ def main():
             cfg.json = PROJECT_ROOT / "work/results" / f"{name}_eer_DEGENERATE.json"
 
     rows = []
-    for n, dp, t, X, u in pts:
+    t0 = time.time()
+    for i, (n, dp, t, X, u) in enumerate(pts):
         Xg = take(X, u, utts)
         r = score(Xg, spk, sent, cfg.folds, cfg.pca, cfg.seed)
         rows.append(dict(model=llm["model"], point=n, track=t, depth=dp, dim=int(Xg.shape[1]), **r))
         print(f"  {n:>11} d={dp:>4}  eer_cos {r['eer_cos']:.3f}  eer_wccn {r['eer_wccn']:.3f}  "
-              f"hard {r['eer_cos_hard']:.3f}/{r['eer_wccn_hard']:.3f}", flush=True)
+              f"hard {r['eer_cos_hard']:.3f}/{r['eer_wccn_hard']:.3f}  [{i + 1}/{len(pts)}, "
+              f"{time.time() - t0:.0f}s]", flush=True)
     base_rows = []
     for bn, (F, u) in baselines.items():
         r = score(take(F, u, utts), spk, sent, cfg.folds, cfg.pca, cfg.seed)
