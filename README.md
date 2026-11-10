@@ -190,3 +190,19 @@ PUSH=1 bash scripts/run_eer.sh         # full run, pushes results/*_eer.json
 ```
 
 Locally: `python lyprobe/plot_eer.py` writes `docs/fig_eer.png`.
+
+## Speaker head on Lychee (training, `lyspk/`)
+
+mpmoshi-oracle's streaming speaker-prediction head (cache + FIFO + chunk Sortformer),
+put on Lychee-FD with LoRA in the audio encoder, the adaptor and trunk layers 1..L.
+Design, re-derived numbers and gaps: [docs/SPK_HEAD_LYCHEE.md](docs/SPK_HEAD_LYCHEE.md).
+
+```bash
+conda activate spkprobe && cd /work/b12901015/lychee-layer-probe && git pull
+SMOKE=1 bash scripts/run_spk.sh      # 50 dialogues, 20 steps: checks loading, memory, speed
+bash scripts/run_spk.sh              # synthetic dialogues (25 TTS voices, 5 held out), 3000 steps, eval
+PUSH=1 bash scripts/run_spk.sh       # same, then push results/spk/<name>/*.json
+```
+
+Laptop checks (torch + transformers + librosa + soundfile; tiny random Lychee-shaped host):
+`python -m unittest tests.test_spk -v`
