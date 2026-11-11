@@ -142,10 +142,11 @@ class LycheeHost(nn.Module):
         del model
         return host.to(device)
 
-    def apply_lora(self, enc_rank=16, llm_rank=16, adaptor_rank=16, scaling=2.0, enc_blocks=None):
+    def apply_lora(self, enc_rank=16, llm_rank=16, adaptor_rank=16, scaling=2.0, enc_blocks=None, llm_high_rank=0):
         """LoRA on the encoder blocks (all, or the indices in ``enc_blocks``), the adaptor's two
         linears (only when the trunk is read: with L = 0 the adaptor feeds nothing the loss
-        sees) and q/k/v/o/gate/up/down of every kept trunk layer. Returns counts."""
+        sees) and q/k/v/o/gate/up/down of trunk layers 1..L; in dialogue mode also of layers
+        L+1..end at ``llm_high_rank``. Returns counts."""
         n = {"encoder": 0, "adaptor": 0, "llm": 0}
         blocks = list(self.encoder.blocks)
         pick = range(len(blocks)) if enc_blocks is None else enc_blocks
@@ -157,6 +158,13 @@ class LycheeHost(nn.Module):
         if llm_rank and self.llm_layers:
             for layer in list(self.lm.layers)[:self.llm_layers]:
                 n["llm"] += wrap_linears(layer, llm_rank, scaling, names=QWEN2_LINEARS)
+        if llm_high_rank and self.dialogue:
+            # mpmoshi's second LoRA group (Moshi layers 16-31, rank 8): the trunk above the readout.
+            # It only changes what the readout never sees, so the head's features are unaffected;
+            # the branches stay frozen as mpmoshi keeps the depformer free of LoRA.
+            n["llm_high"] = 0
+            for layer in list(self.lm.layers)[self.llm_layers:]:
+                n["llm_high"] += wrap_linears(layer, llm_high_rank, scaling, names=QWEN2_LINEARS)
         if self.llm_layers and self.grad_ckpt:
             mods = [self.lm] + ([self.stoken_model, self.merge_model, self.control_model] if self.dialogue else [])
             for mod in mods:

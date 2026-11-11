@@ -237,3 +237,21 @@ def crop_sequence(turns, f0, f1, text_fn, delay=STOKEN_DELAY, rng=None, align=5,
         seq["control_label_start"] = np.where(np.isin(lab, [TOK["start_speaking"], TOK["start_listening"]]),
                                               lab, IGNORE)
     return c0 * align, seq, st
+
+
+def agent_active_fraction(agent_segments, f0, f1, fps=12.5):
+    """Share of 12.5 Hz frames in [f0, f1) where the agent speaks (its own segments, rastered
+    like the head's labels: floor of the start, ceil of the end)."""
+    on = np.zeros(max(int(f1) - int(f0), 0), bool)
+    for sgm in agent_segments:
+        a = max(int(np.floor(float(sgm["start"]) * fps + 1e-6)), int(f0))   # 4.4 s * 12.5 is 55.000...01
+        b = min(int(np.ceil(float(sgm["end"]) * fps - 1e-6)), int(f1))
+        if b > a:
+            on[a - int(f0):b - int(f0)] = True
+    return float(on.mean()) if len(on) else 0.0
+
+
+def agent_text_weight(frac_agent_active):
+    """mpmoshi moshi_ms/p1c_labels.py agent_text_weight, unchanged: down-weight the agent's text and
+    speech loss when the agent is quiet in the crop. clip(frac / 0.15, 0.1, 1.0)."""
+    return float(np.clip(float(frac_agent_active) / 0.15, 0.1, 1.0))

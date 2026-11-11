@@ -42,11 +42,17 @@ OUT=work/spk/mt
 TOKDIR=models/step_audio2_tok
 TOK=$TOKDIR/token2wav/speech_tokenizer_v2_25hz.onnx
 M=$MP/data/manifests
-ACCUM=${ACCUM:-2}                    # crops per optimizer step (one crop per forward)
+ACCUM=${ACCUM:-8}                    # crops per optimizer step, one crop per forward (mpmoshi: 1 GPU x accum 8)
 EVERY=${EVERY:-50}                   # validation and checkpoint every EVERY steps
 train=(--eval-every "$EVERY" --save-every "$EVERY" --keep-last "${KEEP_LAST:-0}")
+# taken from mpmoshi's stage-1 run (train_p1d_fix + stage1.env), where they carry over:
+#   AMI crops 60-120 s (IF / SD scenes whole), warmup ~4 % of the run, trunk LoRA rank 32 below the
+#   readout at 1e-4 and rank 8 above it at 2e-5, head lr 3e-4, wd 0.01, clip 1.0, the id4 head
+#   (chair + region ids instead of pos/seg embeddings: HEAD_MODE=chunk4_s2_id4 there)
+mp=(--crop-min 60 --crop-max 120 --warmup 50 --llm-lora-rank 32 --llm-high-lora-rank 8
+    --lr-lora 1e-4 --lr-lora-high 2e-5 --lr-head 3e-4 --mode lychee_c5_id4)
 if [[ "${SMOKE:-0}" == "1" ]]; then
-  OUT=work/spk/mt_smoke; NAME=smoke_mt; STEPS=20
+  OUT=work/spk/mt_smoke; NAME=smoke_mt; STEPS=20; ACCUM=2     # memory is per crop, so accum 2 suffices
   train=(--eval-every 10 --save-every 0 --eval-clips 4 --log-every 1)
 fi
 mkdir -p "$OUT"
@@ -92,7 +98,7 @@ resume=()
 [[ "${SMOKE:-0}" != "1" && -f "work/spk/runs/$NAME/ckpt_latest.pt" && "${FRESH:-0}" != "1" ]] && resume=(--resume "work/spk/runs/$NAME/ckpt_latest.pt")
 $PY -u -m lyspk.train --dialogue --train "$OUT/if_train.turns.jsonl" "$OUT/sd_train.turns.jsonl" "$OUT/ami_train.turns.jsonl" \
   --train-weights $MIX --val "$OUT/val.turns.jsonl" --name "$NAME" --llm-layers "$LLM_LAYERS" --steps "$STEPS" --accum "$ACCUM" \
-  "${train[@]}" ${resume[@]+"${resume[@]}"} ${EXTRA:-}
+  "${mp[@]}" "${train[@]}" ${resume[@]+"${resume[@]}"} ${EXTRA:-}
 
 echo "== 4/4 evaluate on all of $OUT/val.turns.jsonl"
 $PY -u -m lyspk.evaluate --ckpt "work/spk/runs/$NAME/ckpt_final.pt" --manifest "$OUT/val.turns.jsonl"

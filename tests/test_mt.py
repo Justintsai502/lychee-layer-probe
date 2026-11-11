@@ -129,6 +129,16 @@ class TestDialogSequence(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_sequence(10, a + 1, placed, lambda s: [1])
 
+    def test_agent_weight_is_mpmoshis(self):
+        from lyspk.dialog import agent_active_fraction, agent_text_weight
+        segs = [{"start": 0.0, "end": 0.8}, {"start": 4.0, "end": 4.4}]       # 10 + 5 frames
+        self.assertAlmostEqual(agent_active_fraction(segs, 0, 100), 0.15)
+        self.assertAlmostEqual(agent_active_fraction(segs, 50, 100), 5 / 50)
+        self.assertEqual(agent_text_weight(0.15), 1.0)
+        self.assertEqual(agent_text_weight(0.5), 1.0)
+        self.assertAlmostEqual(agent_text_weight(0.075), 0.5)
+        self.assertEqual(agent_text_weight(0.0), 0.1)
+
     def test_control_mask_rule(self):
         lab = np.full(200, IGNORE)
         seq = [TOK["keep_listening"]] * 10 + [TOK["start_speaking"]] + [TOK["keep_speaking"]] * 6 + \
@@ -263,10 +273,15 @@ class TestMultiTrack(unittest.TestCase):
                         "--run-dir", str(run), "--steps", "3", "--accum", "2", "--eval-every", "3",
                         "--save-every", "0", "--eval-clips", "2", "--eval-seconds", "12", "--log-every", "1",
                         "--crop-min", "6", "--crop-max", "10", "--enc-lora-rank", "4", "--llm-lora-rank", "4",
-                        "--adaptor-lora-rank", "4", "--warmup", "1"])
+                        "--adaptor-lora-rank", "4", "--warmup", "1", "--llm-high-lora-rank", "2",
+                        "--mode", "lychee_c5_id4"])
             rows = [json.loads(x) for x in (run / "train.jsonl").read_text().splitlines()]
             self.assertEqual(len(rows), 3)
             self.assertTrue(all(np.isfinite(r["loss"]) and "dlg_text" in r for r in rows))
+            self.assertTrue(all(0.1 <= r["w_agent_text"] <= 1.0 and 0 <= r["agent_frac"] <= 1 for r in rows))
+            rc = json.loads((run / "run_config.json").read_text())
+            self.assertEqual(rc["lora_linears"]["llm_high"], 2 * 7)      # tiny trunk layers 3-4, 7 linears each
+            self.assertEqual(rc["head_spec"]["mode"], "lychee_c5_id4")
             self.assertTrue(all(r["keep"] == 0.0 for r in rows))           # keep defaults off with --dialogue
             ev = json.loads((run / "eval.jsonl").read_text().splitlines()[-1])
             self.assertIn("dlg", ev)

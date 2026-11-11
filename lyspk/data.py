@@ -99,7 +99,8 @@ def view(row, agent=None):
             for s in row["segments"] if s["speaker"] != agent]
     return {"id": row["id"] if agent is None else f"{row['id']}@{agent}", "source": row["source"],
             "duration": row["duration"], "segments": segs, "wav_paths": [row["tracks"][L] for L in others],
-            "agent": agent, "turns": load_turns(row).get(agent, []) if agent is not None else []}
+            "agent": agent, "turns": load_turns(row).get(agent, []) if agent is not None else [],
+            "agent_segments": [s for s in row["segments"] if agent is not None and s["speaker"] == agent]}
 
 
 def _read_mono(path, f0, f1):

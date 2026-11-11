@@ -21,7 +21,13 @@ mpmoshi's dialogue loss is back, as Lychee's own: one participant per crop is th
 the input is everyone else's tracks summed, the head labels only the others, and the
 agent's turns are teacher-forced into the text / stoken / control channels (lyspk.dialog):
 
-       + dlg_weight x (text CE + stoken CE + control CE)       (LycheeHost.dialogue_losses)
+       + dlg_weight x (w_at x (text CE + stoken CE) + control CE)  (LycheeHost.dialogue_losses)
+
+w_at is mpmoshi's agent_text_weight, clip(agent share of the crop / 0.15, 0.1, 1): the
+agent's text and speech loss count less when the agent barely speaks in the crop
+(--no-agent-weight drops it). LoRA groups follow mpmoshi: trunk 1..L at --lr-lora, the
+trunk above L (dialogue only, rank --llm-high-lora-rank) at --lr-lora-high, plus the
+encoder / adaptor LoRA at --lr-lora; head + readout + tau at --lr-head.
 
 The keep term then defaults to 0 (--keep-weight sets it). Without --dialogue the keep
 term stands in for it: the LoRA is held to the frozen model at the one tensor everything
@@ -82,7 +88,9 @@ def parse_args(argv=None):
                     help="trunk layers read and LoRA'd (0 = encoder only, no trunk at all). Must stay below "
                          "any layer where speaker information derived from these labels is later injected")
     ap.add_argument("--enc-lora-rank", type=int, default=16)
-    ap.add_argument("--llm-lora-rank", type=int, default=16)
+    ap.add_argument("--llm-lora-rank", type=int, default=16, help="trunk layers 1..L")
+    ap.add_argument("--llm-high-lora-rank", type=int, default=8,
+                    help="--dialogue only: trunk layers L+1..28 (mpmoshi: Moshi layers 16-31 at rank 8); 0 = frozen")
     ap.add_argument("--adaptor-lora-rank", type=int, default=16)
     ap.add_argument("--lora-scaling", type=float, default=2.0)
     ap.add_argument("--no-grad-ckpt", action="store_true")
@@ -92,6 +100,7 @@ def parse_args(argv=None):
     ap.add_argument("--steps", type=int, default=3000)
     ap.add_argument("--accum", type=int, default=2)
     ap.add_argument("--lr-lora", type=float, default=1e-4)
+    ap.add_argument("--lr-lora-high", type=float, default=2e-5, help="upper-trunk LoRA (mpmoshi's high group)")
     ap.add_argument("--lr-head", type=float, default=3e-4)
     ap.add_argument("--warmup", type=int, default=200)
     ap.add_argument("--weight-decay", type=float, default=0.01)
@@ -103,6 +112,8 @@ def parse_args(argv=None):
     ap.add_argument("--dialogue", action="store_true",
                     help="load all of Lychee and add its own text/stoken/control loss on the agent's turns")
     ap.add_argument("--dlg-weight", type=float, default=1.0)
+    ap.add_argument("--no-agent-weight", action="store_true",
+                    help="drop mpmoshi's agent_text_weight (text + stoken x clip(agent share / 0.15, 0.1, 1))")
     # bookkeeping
     ap.add_argument("--eval-every", type=int, default=250)
     ap.add_argument("--eval-clips", type=int, default=16)
@@ -143,7 +154,8 @@ def build(cfg):
         host = LycheeHost.from_pretrained(cfg.model_dir, cfg.code_dir, cfg.device, cfg.llm_layers,
                                           attn=cfg.attn, grad_ckpt=not cfg.no_grad_ckpt, dialogue=cfg.dialogue)
     lora_config = {"enc_rank": cfg.enc_lora_rank, "llm_rank": cfg.llm_lora_rank,
-                   "adaptor_rank": cfg.adaptor_lora_rank, "scaling": cfg.lora_scaling}
+                   "adaptor_rank": cfg.adaptor_lora_rank, "scaling": cfg.lora_scaling,
+                   "llm_high_rank": cfg.llm_high_lora_rank if cfg.dialogue else 0}
     n_lora = host.apply_lora(**lora_config)
     readout = GroupReadout(host.groups()).to(cfg.device)
     head = SortformerHead(384, spec=spec).to(cfg.device)
@@ -162,7 +174,7 @@ def main(argv=None):
 
     import torch
 
-    from lyspk.dialog import crop_sequence
+    from lyspk.dialog import agent_active_fraction, agent_text_weight, crop_sequence
 
     from lyspk.contrast import push_queue, segments, supcon
     from lyspk.evaluate import eval_windows, stream_scores, summary_line
@@ -194,13 +206,23 @@ def main(argv=None):
                                dialogue=cfg.dialogue) if cfg.val else []
 
     host, readout, head, tau, spec, lora_config, host_config, n_lora = build(cfg)
-    enc_lora = [p for n, p in host.named_parameters() if "lora_" in n and n.startswith("encoder.")]
-    llm_lora = [p for n, p in host.named_parameters() if "lora_" in n and not n.startswith("encoder.")]
+    import re
+
+    def trunk_layer(name):
+        m = re.match(r"lm\.layers\.(\d+)\.", name)
+        return int(m.group(1)) if m else -1
+
+    lora_named = [(n, p) for n, p in host.named_parameters() if "lora_" in n]
+    enc_lora = [p for n, p in lora_named if n.startswith("encoder.")]
+    llm_lora = [p for n, p in lora_named if not n.startswith("encoder.") and trunk_layer(n) < host.llm_layers]
+    high_lora = [p for n, p in lora_named if trunk_layer(n) >= host.llm_layers]
     head_params = list(readout.parameters()) + list(head.parameters()) + [tau]
     groups = [{"params": enc_lora, "lr": cfg.lr_lora, "name": "enc_lora"},
               {"params": head_params, "lr": cfg.lr_head, "name": "head"}]
     if llm_lora:
         groups.insert(1, {"params": llm_lora, "lr": cfg.lr_lora, "name": "llm_lora"})
+    if high_lora:
+        groups.insert(2, {"params": high_lora, "lr": cfg.lr_lora_high, "name": "llm_high_lora"})
     for g in groups:
         g["base_lr"] = g["lr"]
     opt = torch.optim.AdamW(groups, weight_decay=cfg.weight_decay)
@@ -324,10 +346,13 @@ def main(argv=None):
             dlg = {}
             if "dlg" in out:
                 d = out["dlg"]
-                loss = loss + cfg.dlg_weight * (d["text"][0] + d["stoken"][0] + d["control"][0])
+                frac = agent_active_fraction(r.get("agent_segments", []), f0, f1)
+                w_at = 1.0 if cfg.no_agent_weight else agent_text_weight(frac)
+                loss = loss + cfg.dlg_weight * (w_at * (d["text"][0] + d["stoken"][0]) + d["control"][0])
                 dlg = {f"dlg_{k}": float(v[0].detach()) for k, v in d.items()}
                 dlg.update({f"n_{k}": v[1] for k, v in d.items()})
-                dlg["ctrl_acc"] = d["control"][2] / max(d["control"][1], 1)
+                dlg.update({"ctrl_acc": d["control"][2] / max(d["control"][1], 1), "agent_frac": frac,
+                            "w_agent_text": w_at})
             (loss / cfg.accum).backward()
             if emb is not None:
                 peers.append((emb.detach(), ids))
@@ -355,7 +380,8 @@ def main(argv=None):
             print(f"step {step} loss {rec['loss']:.4f} sort {rec['diar_sort']:.4f} pil {rec['diar_pil']:.4f} "
                   f"con {rec['con']:.3f} (/chance {rec['con_rel']:.2f}) keep {rec['keep']:.4f} gn {gnorm:.2f} {rec['sec']:.1f}s "
                   f"top-layer {top}" + (f" | dlg text {rec['dlg_text']:.3f} stoken {rec['dlg_stoken']:.3f} "
-                                        f"control {rec['dlg_control']:.3f} acc {rec['ctrl_acc']:.2f}"
+                                        f"control {rec['dlg_control']:.3f} acc {rec['ctrl_acc']:.2f} "
+                                        f"w_at {rec['w_agent_text']:.2f}"
                                         if "dlg_text" in rec else ""), flush=True)
         if cfg.eval_every and step % cfg.eval_every == 0:
             evaluate()

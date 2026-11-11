@@ -91,10 +91,22 @@ token ids from the released `config.json`). `lyspk/dialog.py` has the details.
   - A turn starts 0.44 s (delay + `<tts_start>`) before its real speech, so its speech tokens land on time.
   - At least one listening chunk follows each turn (where `start_speaking` goes). A turn that would start sooner is pushed later.
   - A crop never starts inside a turn.
-- **Loss:** text CE + stoken CE + control CE, as `LycheeFD.forward` sums them (shifted, clamped vocab ranges). The LM head is applied only where a label exists.
+- **Loss:** `diar + 0.2 x con + w_at x (text CE + stoken CE) + control CE`, mpmoshi's `dialogue + diar + 0.2 * con`. The three CE terms are computed as `LycheeFD.forward` computes them (shifted, clamped vocab ranges). The LM head is applied only where a label exists.
+  - `w_at` is mpmoshi's `agent_text_weight`, unchanged: clip(agent's share of the crop's frames / 0.15, 0.1, 1). The agent's text and speech count less when it barely speaks. mpmoshi scales Moshi's agent text and agent audio this way; control has no Moshi counterpart and stays at 1.
+  - mpmoshi's user-audio term (Moshi also predicts the user stream) has no Lychee counterpart. Neither do its agent-voice contrastive anchors: Lychee's input has no agent audio.
   - `tests/test_mt.py` checks that the three numbers equal `LycheeFD.forward`'s on a randomly initialised LycheeFD built from the upstream class.
 - **What is trained, and the cost:**
-  - LoRA stays on the encoder, adaptor and trunk 1..L. The rest of Lychee is loaded frozen and gradients pass through it: the full trunk, the stoken/merge/control branches and the LM head.
+  - LoRA groups follow mpmoshi's two Moshi groups:
+    - Trunk 1..L (below and at the readout), plus the encoder and adaptor: lr 1e-4. The script uses rank 32 for the trunk, 16 for the encoder.
+    - Trunk L+1..28: rank 8, lr 2e-5.
+    - The stoken / merge / control branches and the LM head stay frozen, as mpmoshi keeps the depformer free of LoRA. Gradients pass through them.
+  - Other settings `scripts/run_spk_mt.sh` takes from mpmoshi's stage-1 run:
+    - 8 crops per step; AMI crops 60-120 s, IF / SD scenes whole.
+    - Warmup about 4 % of the run, then cosine to 0.1.
+    - Head lr 3e-4, weight decay 0.01, global clip 1.0.
+    - The id4 head (`lychee_c5_id4`, mpmoshi's `chunk4_s2_id4`).
+
+    Re-derived, not copied: label_shift 0 and chunk 5 (see above). No voice prompt: Lychee has none.
   - The three branch embedding tables are never used and are dropped: about 22 GB of bf16 weights instead of 25.6 GB.
   - `--keep-weight` defaults to 0 with `--dialogue`.
 - **Eval on the held-out set:**
