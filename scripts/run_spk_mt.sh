@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Speaker head + Lychee's own dialogue loss on mpmoshi's multi-track corpora (AMI / IF / IF-self-distill).
-# docs/SPK_HEAD_LYCHEE.md ("Dialogue loss"). Run on a GPU node from this repo:
+# docs/SPK_HEAD_LYCHEE.md ("Dialogue loss"). Data first, on CPU (scripts/prep_spk_mt.sh), then on a GPU node:
 #
-#   SMOKE=1 bash scripts/run_spk_mt.sh     # 12 recordings per pool, 20 steps: paths, tokenizer, memory, speed
-#   bash scripts/run_spk_mt.sh             # build manifests + speech tokens once, train, evaluate
+#   SMOKE=1 bash scripts/prep_spk_mt.sh && SMOKE=1 bash scripts/run_spk_mt.sh   # 12 recordings/pool, 20 steps
+#   bash scripts/prep_spk_mt.sh            # CPU: manifests + speech tokens -> work/spk/mt/
+#   bash scripts/run_spk_mt.sh             # GPU: train, evaluate
 #   NAME=mt_L8 LLM_LAYERS=8 bash scripts/run_spk_mt.sh
 #   PUSH=1 ...                             # copy the run's small JSON files to results/spk/<name>/ and push
 #   EVERY=100 KEEP_LAST=10 ...             # eval + checkpoint every 100 steps (default 50), keep the newest 10
@@ -22,32 +23,11 @@ if [[ "${SMOKE:-0}" == "1" ]]; then LOG=work/logs/run_spk_mt_smoke_mt.log; else 
 exec > >(tee -a "$LOG") 2>&1
 echo "======== $(date '+%F %T') $0 SMOKE=${SMOKE:-0} NAME=${NAME:-mt} host=$(hostname) log=$LOG"
 
-PY=${PY:-python}
-MP=${MP:-/work/b12901015/mpmoshi-train}
-# Only the three audio roots come from mpmoshi's stage1.env. Sourcing all of it would also set PY to
-# mpmoshi's moshi env (and HF_HOME etc.), which is not the env this repo runs in. Values set here win.
-if [[ -f "$MP/scripts/stage1.env" ]]; then
-  for v in AMI_ROOT IF_ROOT IF_SD4_ROOT; do
-    if [[ -z "${!v:-}" ]]; then
-      line=$(grep -E "^[[:space:]]*(export[[:space:]]+)?$v=" "$MP/scripts/stage1.env" | tail -1 || true)
-      [[ -n "$line" ]] && export "$v=$(echo "${line#*=}" | sed -e 's/^["'\'']//' -e 's/["'\'']$//')"
-    fi
-  done
-fi
-# Still unset: this account's locations (mpmoshi docs/AUDIO_AND_DATA.md, confirmed on the server).
-D=/work/b12901015/datasets
-: "${AMI_ROOT:=$D/ami}" "${IF_ROOT:=$D/synthesized_if_dataset_4spk}" "${IF_SD4_ROOT:=$D/self_distill_4spk_if}"
-export AMI_ROOT IF_ROOT IF_SD4_ROOT
-for v in AMI_ROOT IF_ROOT IF_SD4_ROOT; do [[ -d "${!v}" ]] || { echo "$v=${!v} is not a directory"; exit 1; }; done
-echo "AMI_ROOT=$AMI_ROOT IF_ROOT=$IF_ROOT IF_SD4_ROOT=$IF_SD4_ROOT"
+source scripts/spk_mt_env.sh
 NAME=${NAME:-mt}
 LLM_LAYERS=${LLM_LAYERS:-14}
 STEPS=${STEPS:-1200}
 MIX=${MIX:-"0.4 0.4 0.2"}            # if sd ami, draw shares (mpmoshi: tt=40,sd=40,ami=20 by audio seconds)
-OUT=work/spk/mt
-TOKDIR=models/step_audio2_tok
-TOK=$TOKDIR/token2wav/speech_tokenizer_v2_25hz.onnx
-M=$MP/data/manifests
 ACCUM=${ACCUM:-8}                    # crops per optimizer step, one crop per forward (mpmoshi: 1 GPU x accum 8)
 EVERY=${EVERY:-50}                   # validation and checkpoint every EVERY steps
 train=(--eval-every "$EVERY" --save-every "$EVERY" --keep-last "${KEEP_LAST:-0}")
@@ -58,55 +38,28 @@ train=(--eval-every "$EVERY" --save-every "$EVERY" --keep-last "${KEEP_LAST:-0}"
 mp=(--crop-min 60 --crop-max 120 --warmup 50 --llm-lora-rank 32 --llm-high-lora-rank 8
     --lr-lora 1e-4 --lr-lora-high 2e-5 --lr-head 3e-4 --mode lychee_c5_id4)
 if [[ "${SMOKE:-0}" == "1" ]]; then
-  OUT=work/spk/mt_smoke; NAME=smoke_mt; STEPS=20; ACCUM=2     # memory is per crop, so accum 2 suffices
+  NAME=smoke_mt; STEPS=20; ACCUM=2     # memory is per crop, so accum 2 suffices
   train=(--eval-every 10 --save-every 0 --eval-clips 4 --log-every 1)
 fi
-mkdir -p "$OUT"
-
 [[ -f third_party/lychee_fd_model/LycheeFD.py ]] || bash scripts/fetch_lychee_code.sh
-echo "python: $(command -v $PY) | env: ${CONDA_DEFAULT_ENV:-none} | MP=$MP"
-
-if [[ ! -f "$TOK" ]]; then
-  echo "== 0/4 speech tokenizer -> $TOK"
-  $PY -c "from huggingface_hub import hf_hub_download as d; print(d('stepfun-ai/Step-Audio-2-mini', 'token2wav/speech_tokenizer_v2_25hz.onnx', local_dir='$TOKDIR'))"
+echo "python: $(command -v $PY) | env: ${CONDA_DEFAULT_ENV:-none} | data $OUT"
+# Data prep is CPU work and lives in prep_spk_mt.sh; run it before taking the GPU.
+missing=()
+for f in "${POOLS[@]/%/.turns.jsonl}" val.turns.jsonl; do [[ -f "$OUT/$f" ]] || missing+=("$OUT/$f"); done
+if (( ${#missing[@]} )); then
+  echo "missing ${missing[*]}"
+  echo "run the CPU prep first: ${SMOKE:+SMOKE=1 }bash scripts/prep_spk_mt.sh"
+  exit 1
 fi
 
-echo "== 1/4 multi-track manifests -> $OUT"
-mk() {  # name, then lyspk.mt_data args
-  local name=$1; shift
-  [[ -f "$OUT/$name.jsonl" ]] && { echo "skip $name"; return; }
-  $PY -u -m lyspk.mt_data "$@" --out "$OUT/$name.full.jsonl"
-  if [[ "${SMOKE:-0}" == "1" ]]; then head -n 12 "$OUT/$name.full.jsonl" > "$OUT/$name.jsonl"; else mv "$OUT/$name.full.jsonl" "$OUT/$name.jsonl"; fi
-}
-ANN=$MP/data/ami/annotations
-mk ami_train ami --manifest "$M/ami_train_ads.jsonl" --annotations "$ANN" --exclude "$M/ami_eval.jsonl"
-mk ami_eval  ami --manifest "$M/ami_eval.jsonl" --annotations "$ANN"
-mk if_train  scenes --manifest "$M/if_4spk_train.jsonl" --source if --root "$IF_ROOT" --exclude "$M/if_4spk_test.jsonl"
-mk if_test   scenes --manifest "$M/if_4spk_test.jsonl" --source if --root "$IF_ROOT"
-mk sd_train  scenes --manifest "$M/sd4spk_if_train.jsonl" --source sd --root "$IF_SD4_ROOT" --exclude "$M/if_4spk_test.jsonl"
-
-echo "== 2/4 agent turns + speech tokens (skips rows already done)"
-for n in if_train sd_train ami_train if_test ami_eval; do
-  $PY -u -m lyspk.stoken --manifest "$OUT/$n.jsonl" --out "$OUT/$n.turns.jsonl" --tokenizer "$TOK" \
-    --turns-dir "$OUT/turns/$n"
-done
-# validation: IF test and AMI eval interleaved, so the first --eval-clips windows cover both
-$PY - "$OUT/if_test.turns.jsonl" "$OUT/ami_eval.turns.jsonl" "$OUT/val.turns.jsonl" <<'PYEOF'
-import itertools, sys
-a, b = (open(p).read().splitlines() for p in sys.argv[1:3])
-rows = [x for pair in itertools.zip_longest(a, b) for x in pair if x]
-open(sys.argv[3], "w").write("\n".join(rows) + "\n")
-print(f"wrote {sys.argv[3]}: {len(rows)} rows")
-PYEOF
-
-echo "== 3/4 train -> work/spk/runs/$NAME (trunk layers $LLM_LAYERS, $STEPS steps x $ACCUM crops, mix if/sd/ami $MIX)"
+echo "== 1/2 train -> work/spk/runs/$NAME (trunk layers $LLM_LAYERS, $STEPS steps x $ACCUM crops, mix if/sd/ami $MIX)"
 resume=()
 [[ "${SMOKE:-0}" != "1" && -f "work/spk/runs/$NAME/ckpt_latest.pt" && "${FRESH:-0}" != "1" ]] && resume=(--resume "work/spk/runs/$NAME/ckpt_latest.pt")
 $PY -u -m lyspk.train --dialogue --train "$OUT/if_train.turns.jsonl" "$OUT/sd_train.turns.jsonl" "$OUT/ami_train.turns.jsonl" \
   --train-weights $MIX --val "$OUT/val.turns.jsonl" --name "$NAME" --llm-layers "$LLM_LAYERS" --steps "$STEPS" --accum "$ACCUM" \
   "${mp[@]}" "${train[@]}" ${resume[@]+"${resume[@]}"} ${EXTRA:-}
 
-echo "== 4/4 evaluate on all of $OUT/val.turns.jsonl"
+echo "== 2/2 evaluate on all of $OUT/val.turns.jsonl"
 $PY -u -m lyspk.evaluate --ckpt "work/spk/runs/$NAME/ckpt_final.pt" --manifest "$OUT/val.turns.jsonl"
 
 if [[ "${PUSH:-0}" == "1" && "${SMOKE:-0}" != "1" ]]; then
