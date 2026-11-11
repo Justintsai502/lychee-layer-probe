@@ -147,12 +147,13 @@ def ami_letter(meeting, letter, ann):
 
 
 def find_headset(meeting, channel, roots):
+    """mpmoshi's AMI lookup: roots R, R/amicorpus, R/headset, each with MEETING/audio/ or MEETING/."""
     name = f"{meeting}.Headset-{channel}.wav"
     for r in roots:
-        for p in (r / meeting / "audio" / name, r / meeting / name, r / "amicorpus" / meeting / "audio" / name,
-                  r / "headset" / meeting / name):
-            if p.exists():
-                return p.resolve()
+        for base in (r, r / "amicorpus", r / "headset"):
+            for p in (base / meeting / "audio" / name, base / meeting / name):
+                if p.exists():
+                    return p.resolve()
     return None
 
 

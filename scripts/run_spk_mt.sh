@@ -18,7 +18,17 @@ exec > >(tee -a work/logs/run_spk_mt.log) 2>&1
 
 PY=${PY:-python}
 MP=${MP:-/work/b12901015/mpmoshi-train}
-[[ -f "$MP/scripts/stage1.env" ]] && { set -a; source "$MP/scripts/stage1.env"; set +a; }
+# Only the three audio roots come from mpmoshi's stage1.env. Sourcing all of it would also set PY to
+# mpmoshi's moshi env (and HF_HOME etc.), which is not the env this repo runs in. Values set here win.
+if [[ -f "$MP/scripts/stage1.env" ]]; then
+  for v in AMI_ROOT IF_ROOT IF_SD4_ROOT; do
+    if [[ -z "${!v:-}" ]]; then
+      line=$(grep -E "^[[:space:]]*(export[[:space:]]+)?$v=" "$MP/scripts/stage1.env" | tail -1 || true)
+      [[ -n "$line" ]] && export "$v=$(echo "${line#*=}" | sed -e 's/^["'\'']//' -e 's/["'\'']$//')"
+    fi
+  done
+fi
+echo "AMI_ROOT=${AMI_ROOT:-} IF_ROOT=${IF_ROOT:-} IF_SD4_ROOT=${IF_SD4_ROOT:-}"
 : "${AMI_ROOT:?set AMI_ROOT (or MP with scripts/stage1.env)}"
 : "${IF_ROOT:?set IF_ROOT}"
 : "${IF_SD4_ROOT:?set IF_SD4_ROOT}"
