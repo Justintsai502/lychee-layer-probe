@@ -1,0 +1,9 @@
+{
+  "step": 1200,
+  "head_mode": "lychee_c5_id4",
+  "ckpt": "work/spk/runs/mt/ckpt_step001200.pt",
+  "n_windows": 24,
+  "theta_act": 0.3,
+  "time_base": "audio",
+  "label_shift": 0
+}
