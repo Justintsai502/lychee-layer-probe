@@ -107,7 +107,9 @@ def parse_args(argv=None):
     ap.add_argument("--eval-every", type=int, default=250)
     ap.add_argument("--eval-clips", type=int, default=16)
     ap.add_argument("--eval-seconds", type=float, default=60.0)
-    ap.add_argument("--save-every", type=int, default=500)
+    ap.add_argument("--save-every", type=int, default=500,
+                    help="ckpt_step*.pt (weights only, to pick a step) + ckpt_latest.pt (full state, to resume)")
+    ap.add_argument("--keep-last", type=int, default=0, help="keep only the newest N ckpt_step*.pt (0 = all)")
     ap.add_argument("--log-every", type=int, default=10)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--resume", type=Path, default=None)
@@ -218,9 +220,13 @@ def main(argv=None):
         head.load_state_dict(blob["head"])
         with torch.no_grad():
             tau.copy_(torch.tensor(float(blob["tau"])))
-        opt.load_state_dict(blob["optimizer"])
         step, queue = int(blob["step"]), list(blob.get("queue", []))
-        rng.bit_generator.state = blob["rng"]
+        if "optimizer" in blob:
+            opt.load_state_dict(blob["optimizer"])
+            rng.bit_generator.state = blob["rng"]
+        else:
+            print(f"resume: {cfg.resume.name} is weights only (a ckpt_step file): optimizer state starts fresh; "
+                  f"use ckpt_latest.pt to continue exactly")
         print(f"resumed {cfg.resume} at step {step}")
 
     (run / "run_config.json").write_text(json.dumps(
@@ -229,15 +235,25 @@ def main(argv=None):
          "trainable": n_train, "readout_groups": host.groups()}, indent=1))
 
     def save(final=False):
+        """ckpt_latest.pt / ckpt_final.pt: everything resume needs. ckpt_step*.pt: weights only
+        (no optimizer / queue / rng), about a third of the size, for picking a step by eval."""
         blob = {"step": step, "head_spec": spec.to_dict(), "label_shift": spec.label_shift,
                 "host_config": host_config, "lora_config": lora_config, "lora": lora_state(host),
                 "readout_config": readout.config(), "readout": readout.state_dict(), "head": head.state_dict(),
-                "tau": float(tau.detach()), "optimizer": opt.state_dict(), "rng": rng.bit_generator.state,
-                "queue": queue, "layer_weights": readout.layer_weights()}
-        name = "ckpt_final.pt" if final else f"ckpt_step{step:06d}.pt"
-        torch.save(blob, run / name)
-        torch.save(blob, run / "ckpt_latest.pt")
-        print(f"saved {run / name}", flush=True)
+                "tau": float(tau.detach()), "layer_weights": readout.layer_weights()}
+        full = dict(blob, optimizer=opt.state_dict(), rng=rng.bit_generator.state, queue=queue)
+        tmp = run / "ckpt_latest.pt.tmp"
+        torch.save(full, tmp)
+        tmp.replace(run / "ckpt_latest.pt")          # a crash mid-save never leaves a broken latest
+        if final:
+            torch.save(full, run / "ckpt_final.pt")
+            print(f"saved {run / 'ckpt_final.pt'}", flush=True)
+            return
+        torch.save(blob, run / f"ckpt_step{step:06d}.pt")
+        if cfg.keep_last > 0:
+            for old in sorted(run.glob("ckpt_step*.pt"))[:-cfg.keep_last]:
+                old.unlink()
+        print(f"saved {run / f'ckpt_step{step:06d}.pt'} (+ ckpt_latest.pt)", flush=True)
 
     def evaluate():
         if not val_windows:

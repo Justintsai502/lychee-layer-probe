@@ -6,6 +6,8 @@
 #   bash scripts/run_spk_mt.sh             # build manifests + speech tokens once, train, evaluate
 #   NAME=mt_L8 LLM_LAYERS=8 bash scripts/run_spk_mt.sh
 #   PUSH=1 ...                             # copy the run's small JSON files to results/spk/<name>/ and push
+#   EVERY=100 KEEP_LAST=10 ...             # eval + checkpoint every 100 steps (default 50), keep the newest 10
+#                                          # ckpt_step*.pt (default all); ckpt_latest.pt always holds the resume state
 #
 # Needs the mpmoshi checkout (MP, default /work/b12901015/mpmoshi-train) for its manifests and the vendored
 # AMI annotations, and the wav roots AMI_ROOT / IF_ROOT / IF_SD4_ROOT (read from $MP/scripts/stage1.env
@@ -34,13 +36,15 @@ echo "AMI_ROOT=${AMI_ROOT:-} IF_ROOT=${IF_ROOT:-} IF_SD4_ROOT=${IF_SD4_ROOT:-}"
 : "${IF_SD4_ROOT:?set IF_SD4_ROOT}"
 NAME=${NAME:-mt}
 LLM_LAYERS=${LLM_LAYERS:-14}
-STEPS=${STEPS:-3000}
+STEPS=${STEPS:-1200}
 MIX=${MIX:-"0.4 0.4 0.2"}            # if sd ami, draw shares (mpmoshi: tt=40,sd=40,ami=20 by audio seconds)
 OUT=work/spk/mt
 TOKDIR=models/step_audio2_tok
 TOK=$TOKDIR/token2wav/speech_tokenizer_v2_25hz.onnx
 M=$MP/data/manifests
-train=(--eval-every 250 --save-every 500)
+ACCUM=${ACCUM:-2}                    # crops per optimizer step (one crop per forward)
+EVERY=${EVERY:-50}                   # validation and checkpoint every EVERY steps
+train=(--eval-every "$EVERY" --save-every "$EVERY" --keep-last "${KEEP_LAST:-0}")
 if [[ "${SMOKE:-0}" == "1" ]]; then
   OUT=work/spk/mt_smoke; NAME=smoke_mt; STEPS=20
   train=(--eval-every 10 --save-every 0 --eval-clips 4 --log-every 1)
@@ -83,11 +87,11 @@ open(sys.argv[3], "w").write("\n".join(rows) + "\n")
 print(f"wrote {sys.argv[3]}: {len(rows)} rows")
 PYEOF
 
-echo "== 3/4 train -> work/spk/runs/$NAME (trunk layers $LLM_LAYERS, $STEPS steps, mix if/sd/ami $MIX)"
+echo "== 3/4 train -> work/spk/runs/$NAME (trunk layers $LLM_LAYERS, $STEPS steps x $ACCUM crops, mix if/sd/ami $MIX)"
 resume=()
 [[ "${SMOKE:-0}" != "1" && -f "work/spk/runs/$NAME/ckpt_latest.pt" && "${FRESH:-0}" != "1" ]] && resume=(--resume "work/spk/runs/$NAME/ckpt_latest.pt")
 $PY -u -m lyspk.train --dialogue --train "$OUT/if_train.turns.jsonl" "$OUT/sd_train.turns.jsonl" "$OUT/ami_train.turns.jsonl" \
-  --train-weights $MIX --val "$OUT/val.turns.jsonl" --name "$NAME" --llm-layers "$LLM_LAYERS" --steps "$STEPS" \
+  --train-weights $MIX --val "$OUT/val.turns.jsonl" --name "$NAME" --llm-layers "$LLM_LAYERS" --steps "$STEPS" --accum "$ACCUM" \
   "${train[@]}" ${resume[@]+"${resume[@]}"} ${EXTRA:-}
 
 echo "== 4/4 evaluate on all of $OUT/val.turns.jsonl"
