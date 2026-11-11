@@ -200,13 +200,30 @@ class LycheeHost(nn.Module):
         log_spec = torch.maximum(log_spec, log_spec.max() - 8.0)
         return (log_spec + 4.0) / 4.0
 
+    def log_mel_batch(self, x, n_mels=128, padding=479):
+        """``log_mel`` for every row of ``x`` [n, samples] at once, on x's device, in float32.
+        Each row is normalised by its own maximum, exactly as calling log_mel per window does."""
+        key = (str(x.device), n_mels)
+        if getattr(self, "_mel_dev", None) is None or self._mel_dev[0] != key:
+            import librosa
+            fb = torch.from_numpy(librosa.filters.mel(sr=SR, n_fft=400, n_mels=n_mels)).to(x.device)
+            self._mel_dev = (key, fb, torch.hann_window(400, device=x.device))
+        _, fb, win = self._mel_dev
+        x = F.pad(x.float(), (0, padding))
+        stft = torch.stft(x, 400, 160, window=win, return_complex=True)
+        mags = stft[..., :-1].abs() ** 2                             # [n, 201, frames]
+        log_spec = torch.clamp(fb @ mags, min=1e-10).log10()
+        log_spec = torch.maximum(log_spec, log_spec.amax(dim=(1, 2), keepdim=True) - 8.0)
+        return (log_spec + 4.0) / 4.0
+
     def windows(self, wave):
+        """One log-mel per 0.4 s window, all windows in one batched STFT on the model's device."""
         if len(wave) % WIN:
             raise ValueError(f"waveform must be a multiple of {WIN} samples, got {len(wave)}")
-        mels = [self.log_mel(wave[i:i + WIN]) for i in range(0, len(wave), WIN)]
-        wavs = torch.stack(mels)                                   # [n_win, 128, 42]
-        lens = torch.full((len(mels),), mels[0].shape[1] - 2, dtype=torch.int32)
-        return wavs.to(self.device, self.dtype), lens.to(self.device)
+        x = torch.as_tensor(np.asarray(wave, dtype=np.float32), device=self.device).view(-1, WIN)
+        wavs = self.log_mel_batch(x)                                  # [n_win, 128, 42]
+        lens = torch.full((wavs.shape[0],), wavs.shape[2] - 2, dtype=torch.int32, device=self.device)
+        return wavs.to(self.dtype), lens
 
     def run_encoder(self, wavs, wav_lens):
         """AudioEncoder.forward with every block's output kept (and checkpointed when training).

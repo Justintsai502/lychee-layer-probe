@@ -50,7 +50,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import queue as queue_mod
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -60,6 +62,43 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from lyprobe.common import PROJECT_ROOT, setup_project_cache  # noqa: E402
 from lyspk.data import crop_labels, is_multitrack, load_frames, load_manifest, load_turns, n_frames, view  # noqa: E402
 from lyspk.labels import assert_arrival, crop_frames  # noqa: E402
+
+
+class Prefetcher:
+    """Runs ``make()`` in a daemon thread, keeping up to ``depth`` results ready. An exception in the
+    thread is re-raised by the next ``get()``. Reading audio, resampling and numpy release the GIL,
+    so this overlaps with the GPU work of the main thread."""
+
+    def __init__(self, make, depth):
+        self.q = queue_mod.Queue(maxsize=depth)
+        self.stop = threading.Event()
+
+        def run():
+            while not self.stop.is_set():
+                try:
+                    item = (True, make())
+                except BaseException as e:  # noqa: BLE001 - handed to the main thread
+                    item = (False, e)
+                while not self.stop.is_set():
+                    try:
+                        self.q.put(item, timeout=0.5)
+                        break
+                    except queue_mod.Full:
+                        continue
+                if not item[0]:
+                    return
+
+        self.thread = threading.Thread(target=run, name="prefetch", daemon=True)
+        self.thread.start()
+
+    def get(self):
+        ok, item = self.q.get()
+        if not ok:
+            raise item
+        return item
+
+    def close(self):
+        self.stop.set()
 
 
 def lr_multiplier(step, warmup, total):
@@ -123,6 +162,9 @@ def parse_args(argv=None):
     ap.add_argument("--keep-last", type=int, default=0, help="keep only the newest N ckpt_step*.pt (0 = all)")
     ap.add_argument("--log-every", type=int, default=10)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--prefetch", type=int, default=4,
+                    help="crops prepared ahead in a background thread (reading tracks, resampling, labels, "
+                         "agent sequence) while the GPU trains; 0 = prepare inline")
     ap.add_argument("--resume", type=Path, default=None)
     return ap.parse_args(argv)
 
@@ -197,6 +239,9 @@ def main(argv=None):
             print(f"{p}: {len(rows)} rows, {n_mt} multi-track, {n_turns} with agent turns")
     if cfg.dialogue and not any(r.get("turns") for rows in train_sets for r in rows):
         raise SystemExit("--dialogue: no row has turns; run lyspk.stoken on the multi-track manifests first")
+    # the data side (which recording, agent, crop, control-label thinning) has its own generators,
+    # so it can run in the prefetch thread; rng stays with the main thread (head items, anchors)
+    data_rng = np.random.default_rng([cfg.seed, 1])
     py_rng = random.Random(cfg.seed)
     if cfg.train_weights is not None and len(cfg.train_weights) != len(train_sets):
         raise SystemExit(f"--train-weights has {len(cfg.train_weights)} values for {len(train_sets)} manifests")
@@ -246,6 +291,8 @@ def main(argv=None):
         if "optimizer" in blob:
             opt.load_state_dict(blob["optimizer"])
             rng.bit_generator.state = blob["rng"]
+            if "data_rng" in blob:
+                data_rng.bit_generator.state = blob["data_rng"]
         else:
             print(f"resume: {cfg.resume.name} is weights only (a ckpt_step file): optimizer state starts fresh; "
                   f"use ckpt_latest.pt to continue exactly")
@@ -263,7 +310,8 @@ def main(argv=None):
                 "host_config": host_config, "lora_config": lora_config, "lora": lora_state(host),
                 "readout_config": readout.config(), "readout": readout.state_dict(), "head": head.state_dict(),
                 "tau": float(tau.detach()), "layer_weights": readout.layer_weights()}
-        full = dict(blob, optimizer=opt.state_dict(), rng=rng.bit_generator.state, queue=queue)
+        full = dict(blob, optimizer=opt.state_dict(), rng=rng.bit_generator.state, queue=queue,
+                    data_rng=data_rng.bit_generator.state)
         tmp = run / "ckpt_latest.pt.tmp"
         torch.save(full, tmp)
         tmp.replace(run / "ckpt_latest.pt")          # a crash mid-save never leaves a broken latest
@@ -286,7 +334,17 @@ def main(argv=None):
             f.write(json.dumps(res) + "\n")
         print(f"EVAL step {step}: {summary_line(res)}", flush=True)
 
+    text_lock = threading.Lock()
+    if getattr(host, "text_fn", None) is not None:      # the tokenizer is shared by the prefetch thread and eval
+        _text_fn = host.text_fn
+
+        def locked_text_fn(text):
+            with text_lock:
+                return _text_fn(text)
+        host.text_fn = locked_text_fn
+
     def draw():
+        rng = data_rng
         rows = train_sets[int(rng.choice(len(train_sets), p=mix))]
         r = rows[int(rng.integers(len(rows)))]
         seq = None
@@ -308,7 +366,17 @@ def main(argv=None):
         if float(y.sum()) <= 0:
             return None
         assert_arrival(y, first, r["id"])
-        return r, f0, f1, y, single, keep, slots, first, seq
+        return r, f0, f1, y, single, keep, slots, first, seq, load_frames(r, f0, f1)
+
+    def next_crop():
+        """draw() until it gives a usable crop."""
+        for _ in range(1000):
+            got = draw()
+            if got is not None:
+                return got
+        raise SystemExit("1000 draws in a row gave no usable crop: check the manifests' segments")
+
+    crops = Prefetcher(next_crop, cfg.prefetch) if cfg.prefetch > 0 else None
 
     host.train()
     readout.train()
@@ -321,16 +389,12 @@ def main(argv=None):
         opt.zero_grad(set_to_none=True)
         peers, parts = [], []
         t0 = time.time()
-        done = misses = 0
+        done, wait = 0, 0.0
         while done < cfg.accum:
-            got = draw()
-            if got is None:
-                misses += 1
-                if misses > 1000:
-                    raise SystemExit("1000 draws in a row gave no usable crop: check the manifests' segments")
-                continue
-            r, f0, f1, y, single, keep, slots, first, seq = got
-            wave = load_frames(r, f0, f1)
+            tw = time.time()
+            got = crops.get() if crops is not None else next_crop()
+            wait += time.time() - tw
+            r, f0, f1, y, single, keep, slots, first, seq, wave = got
             ref = None
             if cfg.keep_weight > 0:
                 with torch.no_grad(), lora_disabled():
@@ -370,7 +434,7 @@ def main(argv=None):
         step += 1
         keys = sorted({k for p in parts for k in p} - {"source"})
         rec = {k: float(np.mean([p[k] for p in parts if k in p])) for k in keys}
-        rec.update({"step": step, "lr_mult": mult, "grad_norm": gnorm, "sec": time.time() - t0,
+        rec.update({"step": step, "lr_mult": mult, "grad_norm": gnorm, "sec": time.time() - t0, "data_wait": wait,
                     "tau": float(tau.detach()), "queue": len(queue), "elapsed_h": (time.time() - t_start) / 3600})
         log.write(json.dumps(rec) + "\n")
         log.flush()
@@ -379,6 +443,7 @@ def main(argv=None):
             top = {k: int(np.argmax(v)) for k, v in w.items()}
             print(f"step {step} loss {rec['loss']:.4f} sort {rec['diar_sort']:.4f} pil {rec['diar_pil']:.4f} "
                   f"con {rec['con']:.3f} (/chance {rec['con_rel']:.2f}) keep {rec['keep']:.4f} gn {gnorm:.2f} {rec['sec']:.1f}s "
+                  f"(data wait {wait:.1f}s) "
                   f"top-layer {top}" + (f" | dlg text {rec['dlg_text']:.3f} stoken {rec['dlg_stoken']:.3f} "
                                         f"control {rec['dlg_control']:.3f} acc {rec['ctrl_acc']:.2f} "
                                         f"w_at {rec['w_agent_text']:.2f}"
@@ -388,6 +453,8 @@ def main(argv=None):
         if cfg.save_every and step % cfg.save_every == 0:
             save()
     log.close()
+    if crops is not None:
+        crops.close()
     if not (cfg.eval_every and step % cfg.eval_every == 0 and step > 0) or cfg.resume:
         evaluate()
     save(final=True)

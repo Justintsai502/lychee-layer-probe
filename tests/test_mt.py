@@ -262,6 +262,33 @@ class TestMultiTrack(unittest.TestCase):
         frozen = [p for n, p in host.named_parameters() if "lora_" not in n]
         self.assertTrue(all(not p.requires_grad for p in frozen))
 
+    def test_batched_mel_equals_per_window(self):
+        import torch
+        from lyspk.host import WIN, tiny_host
+        host = tiny_host(CODE, llm_layers=2)
+        wave = (0.1 * np.random.default_rng(3).standard_normal(7 * WIN)).astype(np.float32)
+        wave[2 * WIN:3 * WIN] = 0.0                                      # a silent window: own max per window
+        wavs, lens = host.windows(wave)
+        ref = torch.stack([host.log_mel(wave[i:i + WIN]) for i in range(0, len(wave), WIN)])
+        self.assertEqual(tuple(wavs.shape), tuple(ref.shape))
+        self.assertTrue(torch.allclose(wavs.float(), ref.float(), atol=1e-5))
+        self.assertTrue(bool((lens == ref.shape[2] - 2).all()))
+
+    def test_prefetch_gives_the_same_run(self):
+        from lyspk import train
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            _, man = build_turns_manifest(d)
+            losses = {}
+            for k in ("0", "3"):
+                run = d / f"run{k}"
+                train.main(["--host", "tiny", "--device", "cpu", "--dialogue", "--train", str(man), "--run-dir", str(run),
+                            "--steps", "2", "--accum", "2", "--eval-every", "0", "--save-every", "0", "--log-every", "1",
+                            "--crop-min", "6", "--crop-max", "10", "--enc-lora-rank", "4", "--llm-lora-rank", "4",
+                            "--adaptor-lora-rank", "4", "--warmup", "1", "--prefetch", k])
+                losses[k] = [json.loads(x)["loss"] for x in (run / "train.jsonl").read_text().splitlines()]
+            self.assertEqual(losses["0"], losses["3"])
+
     def test_train_eval_dialogue(self):
         import torch
         from lyspk import evaluate, train
