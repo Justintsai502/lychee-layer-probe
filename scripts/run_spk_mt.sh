@@ -34,10 +34,12 @@ if [[ -f "$MP/scripts/stage1.env" ]]; then
     fi
   done
 fi
-echo "AMI_ROOT=${AMI_ROOT:-} IF_ROOT=${IF_ROOT:-} IF_SD4_ROOT=${IF_SD4_ROOT:-}"
-: "${AMI_ROOT:?set AMI_ROOT (or MP with scripts/stage1.env)}"
-: "${IF_ROOT:?set IF_ROOT}"
-: "${IF_SD4_ROOT:?set IF_SD4_ROOT}"
+# Still unset: this account's locations (mpmoshi docs/AUDIO_AND_DATA.md, confirmed on the server).
+D=/work/b12901015/datasets
+: "${AMI_ROOT:=$D/ami}" "${IF_ROOT:=$D/synthesized_if_dataset_4spk}" "${IF_SD4_ROOT:=$D/self_distill_4spk_if}"
+export AMI_ROOT IF_ROOT IF_SD4_ROOT
+for v in AMI_ROOT IF_ROOT IF_SD4_ROOT; do [[ -d "${!v}" ]] || { echo "$v=${!v} is not a directory"; exit 1; }; done
+echo "AMI_ROOT=$AMI_ROOT IF_ROOT=$IF_ROOT IF_SD4_ROOT=$IF_SD4_ROOT"
 NAME=${NAME:-mt}
 LLM_LAYERS=${LLM_LAYERS:-14}
 STEPS=${STEPS:-1200}
