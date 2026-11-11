@@ -322,6 +322,47 @@ class TestMultiTrack(unittest.TestCase):
             self.assertAlmostEqual(res["dlg"]["text"]["ce"], ev["dlg"]["text"]["ce"], places=5)
             torch.set_grad_enabled(True)
 
+            # mpmoshi's diagnostic battery on the same checkpoint
+            from lyspk import diag
+            out = d / "diag"
+            s = diag.main(["--ckpt", str(run / "ckpt_final.pt"), "--manifest", f"tt={man}", "--out", str(out),
+                           "--device", "cpu", "--window-sec", "12", "--sessions", "3", "--boot", "50"])
+            for f in ("summary.json", "per_window.json", "meta.json", "preds.npz", "hspk.npz"):
+                self.assertTrue((out / f).exists(), f)
+            self.assertEqual(s["n_windows"], 3)
+            self.assertEqual(set(s["by_variant"]), {"all", "tt"})
+            want = set(diag.LIVE) | set(diag.BANKS)
+            self.assertEqual(set(s["by_variant"]["all"]), want)
+            per = json.loads((out / "per_window.json").read_text())
+            for name in want:                 # every variant is counted over the same frames
+                self.assertEqual([r["n_single"] for r in per[name]], [r["n_single"] for r in per["self"]])
+                self.assertEqual([r["change_n"] for r in per[name]], [r["change_n"] for r in per["self"]])
+                for m in ("frame_acc", "turn_acc", "change_acc"):
+                    v = s["by_variant"]["all"][name][m]
+                    self.assertTrue(v is None or 0.0 <= v <= 1.0)
+            self.assertIn("gold-wrong", s["paired"]["tt"])
+            self.assertEqual(s["paired"]["tt"]["gold-empty"]["frame"]["n_groups"], 3)
+            pz = np.load(out / "preds.npz")       # the policies really feed the head different caches
+            for a, b in (("gold", "empty"), ("gold", "wrong"), ("self", "silenced"), ("spread", "one only")):
+                self.assertFalse(all(np.array_equal(pz[f"prob_{a}_{i}"], pz[f"prob_{b}_{i}"]) for i in range(3)), (a, b))
+            torch.set_grad_enabled(True)
+
+    def test_diag_metrics_on_gold(self):
+        from lyspk.bank_sets import build_sets
+        from lyspk.diag_metrics import per_window
+        y = np.zeros((40, 3), int)
+        y[0:10, 0] = 1
+        y[8:20, 1] = 1
+        y[25:40, 2] = 1
+        keep = np.ones(40, bool)
+        r = per_window(y.astype(float), y, keep, 0.3)
+        self.assertEqual((r["frame_ok"], r["turn_mode_ok"], r["change_ok"]), (r["n_single"], r["turn_n"], r["change_n"]))
+        self.assertEqual(r["turn_n"], 3)                   # per-slot runs, not runs of constant id
+        single = np.where(y.sum(1) == 1, y.argmax(1), -1)
+        sets = build_sets(single, keep, 3, 4)
+        self.assertEqual(sets["wrong"][0], sets["spread"][1])
+        self.assertEqual(sets["one only"][0], sets["one xK"][0][:1])
+
 
 if __name__ == "__main__":
     unittest.main()
