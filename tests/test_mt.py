@@ -72,6 +72,32 @@ def write_scenes(root, n=4, seconds=14.0, sr=24000):
     return man
 
 
+def write_fake_kit(d, sr=24000):
+    """A two-task mpbench_mp100_eval_kit layout plus the MP-Bench audio tree it points at."""
+    import soundfile as sf
+    kit, audio = d / "kit", d / "mpbench"
+    (kit / "subset").mkdir(parents=True)
+    (kit / "gold_speakers").mkdir()
+    (kit / "scripts").mkdir()
+    (kit / "scripts" / "score_spk.py").write_text("import sys; print(' '.join(sys.argv[1:]))\n")
+    rows = ["task\tdataset_index\tfamily\tshould_speak\tis_speaker_name\tquestion_type\tinput_dur_s\tn_gold_frames\tchairs"]
+    rng = np.random.default_rng(3)
+    for task, n in (("task_a", 131), ("task_b", 77)):
+        spk = np.repeat(rng.integers(0, 4, n // 6 + 1), 6)[:n]
+        np.savez(kit / "gold_speakers" / f"{task}.npz", spk=spk, frame_rate=np.float32(12.5))
+        t = np.arange(int(n / 12.5 * sr)) / sr
+        x = np.zeros_like(t, dtype=np.float32)
+        for k, f0 in ((1, 140), (2, 220), (3, 330)):
+            on = np.repeat(spk == k, int(sr / 12.5))[: len(t)]
+            x[: len(on)] += 0.3 * on * np.sin(2 * np.pi * f0 * t[: len(on)])
+        w = audio / "tasks" / "data" / task
+        w.mkdir(parents=True)
+        sf.write(w / "all_stitched.wav", x, sr)
+        rows.append(f"{task}\t0\tunderstanding\ttrue\ttrue\tq\t{n / 12.5:.3f}\t{n}\t1=A;2=B;3=C")
+    (kit / "subset" / "instances.tsv").write_text("\n".join(rows) + "\n")
+    return kit, audio
+
+
 def build_turns_manifest(d):
     """mpmoshi manifest -> lyspk.mt_data scenes -> turns with the fake tokenizer."""
     from lyspk import mt_data, stoken
@@ -346,6 +372,37 @@ class TestMultiTrack(unittest.TestCase):
             for a, b in (("gold", "empty"), ("gold", "wrong"), ("self", "silenced"), ("spread", "one only")):
                 self.assertFalse(all(np.array_equal(pz[f"prob_{a}_{i}"], pz[f"prob_{b}_{i}"]) for i in range(3)), (a, b))
             torch.set_grad_enabled(True)
+
+            # MP-Bench 100 speaker-id on a fake kit of two tasks
+            from lyspk import mpbench_spk
+            kit, audio = write_fake_kit(d)
+            mp = d / "mp100"
+            s = mpbench_spk.main(["--ckpt", str(run / "ckpt_final.pt"), "--kit", str(kit), "--audio-root", str(audio),
+                                  "--out", str(mp), "--device", "cpu"])
+            self.assertEqual(s["n_tasks"], 2)
+            for name in mpbench_spk.VARIANTS:
+                for t, n in (("task_a", 131), ("task_b", 77)):
+                    ids = np.load(mp / f"preds_{name}" / f"{t}.npz")["ids"]
+                    self.assertEqual(len(ids), n)                     # cut / padded to the gold length
+                    self.assertTrue(((ids >= 0) & (ids <= 7)).all())
+                self.assertEqual(s["by_variant"][name]["frames"], 131 + 77)
+                self.assertIn("--pred-dir", (mp / f"score_{name}_w12.txt").read_text())
+            pz = np.load(mp / "probs.npz")
+            self.assertFalse(np.array_equal(pz["gold__task_a"], pz["empty__task_a"]))
+            torch.set_grad_enabled(True)
+
+    def test_mpbench_id_mapping(self):
+        from lyspk.mpbench_spk import KIT_TO_BITS, gold_tracks, kit_ids, score
+        prob = KIT_TO_BITS.astype(np.float32) * 0.9            # every kit id, as probabilities
+        self.assertEqual(kit_ids(prob, 0.5).tolist(), list(range(8)))
+        gold = np.array([0, 1, 1, 2, 3, 3, 0])
+        y, single, keep = gold_tracks(gold, 10)
+        self.assertEqual(single.tolist(), [-1, 0, 0, 1, 2, 2, -1, -1, -1, -1])
+        self.assertEqual(keep.sum(), 7)
+        self.assertEqual(kit_ids(y, 0.5)[:7].tolist(), gold.tolist())
+        sc = score(np.array([0, 1, 4, 2, 3, 1, 0, 2, 2]), gold)   # longer prediction is cut
+        self.assertEqual((sc["n"], sc["ok"], sc["n_speech"], sc["ok_speech"]), (7, 5, 5, 3))
+        self.assertEqual((sc["tp1"], sc["on_p1"], sc["on_g1"]), (2, 3, 2))
 
     def test_diag_metrics_on_gold(self):
         from lyspk.bank_sets import build_sets
