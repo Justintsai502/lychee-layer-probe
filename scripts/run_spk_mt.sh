@@ -16,7 +16,11 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 mkdir -p work/logs
-exec > >(tee -a work/logs/run_spk_mt.log) 2>&1
+# Everything (stdout + stderr, every python step) goes to the screen AND to one log per run name,
+# appended across restarts: work/logs/run_spk_mt_<NAME>.log (smoke: run_spk_mt_smoke_mt.log).
+if [[ "${SMOKE:-0}" == "1" ]]; then LOG=work/logs/run_spk_mt_smoke_mt.log; else LOG=work/logs/run_spk_mt_${NAME:-mt}.log; fi
+exec > >(tee -a "$LOG") 2>&1
+echo "======== $(date '+%F %T') $0 SMOKE=${SMOKE:-0} NAME=${NAME:-mt} host=$(hostname) log=$LOG"
 
 PY=${PY:-python}
 MP=${MP:-/work/b12901015/mpmoshi-train}
