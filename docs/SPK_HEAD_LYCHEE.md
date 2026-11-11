@@ -62,11 +62,49 @@ keep  = ||h_L − h_L(frozen)||² / ||h_L(frozen)||², × 1.0
   - Positives are the same global speaker id in the other recordings of the same step.
   - The last 1024 anchors are kept as negatives. One change from mpmoshi: queue rows of the anchor's own speaker are left out rather than counted as negatives. With 20 voices the queue is mostly same-voice rows, and on a toy run counting them as negatives made the term rise.
   - The temperature is learned.
-- **keep** stands in for mpmoshi's dialogue loss, because there is no Lychee dialogue training data here:
+- **keep** stands in for the dialogue loss when there are only single-wav recordings (the synthetic set). With the multi-track corpora, use `--dialogue` (next section) instead:
   - `h_L` is trunk layer L at every suffix slot, or the adaptor output when L = 0.
   - Everything else in Lychee reads only that tensor, so holding it to the frozen model's value keeps the conversation behaviour intact while the encoder learns speakers.
   - The frozen value comes from the same modules with LoRA switched off (`lora_disabled()`), which costs one extra forward pass with no gradient.
   - `--keep-weight 0` lets the LoRA drift freely.
+
+## Dialogue loss (`--dialogue`, multi-track AMI / IF / SD)
+
+mpmoshi's dialogue loss was Moshi's own LM loss on the same meetings: one participant is
+cast as the agent. Here it is Lychee's own loss, built the way Lychee's training code
+builds it (`Training_package/Code/DataLoaders/LycheeFDDataset.py` at the pinned commit,
+token ids from the released `config.json`). `lyspk/dialog.py` has the details.
+
+| Lychee target | from |
+|---|---|
+| text | the agent's utterance text for the turn, laid at the turn start: `ids + <\|EOT\|>`, then `<tts_pad>`. No word timing needed |
+| stoken | the agent's own track for that turn through Step-Audio-2-mini's `speech_tokenizer_v2_25hz.onnx` (25 Hz), via `s3tokenizer` as Step-Audio-2's `token2wav.py` calls it. Laid as `<stoken_delay> x 10, <tts_start>, tokens, <tts_end>`. `stoken_delay_num` is 10 in the released config (the example script says 0) |
+| control | per 0.4 s chunk: `keep_listening` / `start_speaking` / `keep_speaking` / `start_listening`, thinned with Lychee's own `mask_control_label` (all starts, the ends of every keep run, a random 20 % of the rest, at most 3 x the specials) |
+
+- **Per crop:**
+  - One agent is drawn from the recording's participants.
+  - The audio input is the other tracks summed. The agent takes no head slot (as in mpmoshi).
+  - The agent's turns are teacher-forced into the text, stoken and control channels.
+- **One deliberate difference from Lychee's data:** while the agent speaks, Lychee's data feeds silence as user audio. Here the other participants' real audio stays in, because in a meeting they keep talking.
+- **Turns:**
+  - The agent's utterances with pauses < 1.0 s between them are joined, up to 20 s per turn.
+  - A turn starts 0.44 s (delay + `<tts_start>`) before its real speech, so its speech tokens land on time.
+  - At least one listening chunk follows each turn (where `start_speaking` goes). A turn that would start sooner is pushed later.
+  - A crop never starts inside a turn.
+- **Loss:** text CE + stoken CE + control CE, as `LycheeFD.forward` sums them (shifted, clamped vocab ranges). The LM head is applied only where a label exists.
+  - `tests/test_mt.py` checks that the three numbers equal `LycheeFD.forward`'s on a randomly initialised LycheeFD built from the upstream class.
+- **What is trained, and the cost:**
+  - LoRA stays on the encoder, adaptor and trunk 1..L. The rest of Lychee is loaded frozen and gradients pass through it: the full trunk, the stoken/merge/control branches and the LM head.
+  - The three branch embedding tables are never used and are dropped: about 22 GB of bf16 weights instead of 25.6 GB.
+  - `--keep-weight` defaults to 0 with `--dialogue`.
+- **Eval on the held-out set:**
+  - The same teacher-forced sequence, reporting text / stoken / control CE and control accuracy, both over all chunk ends and over the `start_*` chunks alone.
+  - At step 0 (LoRA = identity) these are the frozen Lychee's numbers on this data, which is the baseline the LoRA should not fall below.
+
+Pipeline: `scripts/run_spk_mt.sh`.
+1. `lyspk.mt_data` reads mpmoshi's manifests and the vendored AMI annotations. It holds out every meeting or scene in `ami_eval` / `if_4spk_test`, which includes the 131 SD scenes shared with the IF test set.
+2. `lyspk.stoken` tokenizes every participant's turns once.
+3. `lyspk.train --dialogue` samples if / sd / ami at 0.4 / 0.4 / 0.2 of draws (mpmoshi's 40/40/20 was by audio seconds).
 
 ## Data
 
@@ -106,7 +144,9 @@ Each evaluation reports, for each cache policy:
   - Train → checkpoint → evaluate → resume works.
 
   Loading the real checkpoint, memory use and speed are first checked by `SMOKE=1`.
-- **No dialogue loss.** `keep` constrains the drift; it does not train the conversation.
+- **Dialogue loss: written and tested on toy models only.** `--dialogue` loads all of Lychee: memory and step time are first measured by `SMOKE=1 bash scripts/run_spk_mt.sh`.
+- **AMI crosstalk.** The other participants' headsets pick up the agent faintly, so on AMI the input still contains a little of the agent's own voice (the mpmoshi doc notes the same crosstalk).
+- **Single-wav data** (the synthetic set) has no agent: the `keep` term is the only constraint there.
 - **Small training set.** The synthetic data has only 20 training voices. For real meetings, add an RTTM manifest such as AMI.
 - **Thresholds are untuned.** `theta_act` is 0.30 and `theta_write` is 0.70. The md's sidecar calibration is not ported.
 - **Single GPU only**, and there is no on-policy data.

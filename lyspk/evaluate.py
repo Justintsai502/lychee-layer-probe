@@ -11,6 +11,12 @@ Four cache policies on the same features (lyspk/stream.py):
   python -m lyspk.evaluate --ckpt work/spk/runs/main/ckpt_latest.pt --manifest work/spk/synth/val.jsonl
       [--seconds 60] [--clips 0 = all] [--dump work/spk/eval_dump]
 
+Multi-track rows: one agent per recording, in turn (row i takes agents[i % n]); the input
+is the other tracks. A dialogue checkpoint also gets the agent's turns teacher-forced, as
+in training, and reports Lychee's own losses on them ("dlg": text / stoken / control CE,
+control accuracy over every chunk end and over the start_* chunks alone). At step 0
+(LoRA = identity) those numbers are the frozen Lychee on this data.
+
 Writes <ckpt dir>/eval_<ckpt stem>.json (and per-clip probabilities in audio time with
 --dump). Thresholds: --theta-act / --theta-write, else the checkpoint's spec defaults;
 they are NOT tuned (md section 9: tune on held-out data before comparing checkpoints).
@@ -29,16 +35,23 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from lyprobe.common import PROJECT_ROOT  # noqa: E402
-from lyspk.data import crop_labels, load_frames, load_manifest, n_frames  # noqa: E402
+from lyspk.data import crop_labels, is_multitrack, load_frames, load_manifest, load_turns, n_frames, view  # noqa: E402
 from lyspk.metrics import counts, pool  # noqa: E402
 
 ROTATION = (2, 0, 1)      # lyspk.stream.ROTATION
 
 
-def eval_windows(rows, seconds, max_clips=0, align=5):
-    """Fixed windows: the first ``seconds`` of each recording, cut to whole Lychee windows."""
+def eval_windows(rows, seconds, max_clips=0, align=5, dialogue=False):
+    """Fixed windows: the first ``seconds`` of each recording, cut to whole Lychee windows.
+    Multi-track rows become a view with agents taken in turn (those with turns, for dialogue)."""
     out = []
-    for r in rows[:max_clips or None]:
+    for i, r in enumerate(rows[:max_clips or None]):
+        if is_multitrack(r):
+            cand = list(r.get("agents") or [])
+            if dialogue and r.get("turns"):
+                have = load_turns(r)
+                cand = [a for a in cand if have.get(a)] or cand
+            r = view(r, cand[i % len(cand)] if cand else None)
         f1 = align * (min(n_frames(r), int(seconds * 12.5)) // align)
         if f1 >= 4 * align:
             out.append((r, 0, f1))
@@ -52,15 +65,28 @@ def stream_scores(host, readout, head, spec, windows, theta_act=None, theta_writ
 
     theta_act = spec.theta_act if theta_act is None else float(theta_act)
     theta_write = spec.theta_write if theta_write is None else float(theta_write)
+    from lyspk.dialog import crop_sequence
+
     rows = {k: [] for k in ("self", "gold", "rot", "rot_asis", "empty")}
+    dlg = {}
     was = (host.training, readout.training, head.training)
     host.eval()
     readout.eval()
     try:
         for r, f0, f1 in windows:
+            seq = None
+            if getattr(host, "dialogue", False) and r.get("turns"):
+                f0, seq, _ = crop_sequence(r["turns"], f0, f1, host.text_fn, host.stoken_delay,
+                                           align=spec.align, train=False)
             y, single, keep, _slots, _first = crop_labels(r, f0, f1, spec.label_shift)
             with torch.no_grad():
-                diar = readout(host.features(load_frames(r, f0, f1))["stacks"])[0].float().cpu().numpy()
+                feats = host.features(load_frames(r, f0, f1), seq, losses=seq is not None)
+                diar = readout(feats["stacks"])[0].float().cpu().numpy()
+            for k, (loss, n, correct) in feats.get("dlg", {}).items():
+                a = dlg.setdefault(k, [0.0, 0, 0])
+                a[0] += float(loss) * n
+                a[1] += n
+                a[2] += correct
             jobs = {"self": SelfFill(theta_act, theta_write), "gold": GoldCache(None, single, keep),
                     "rot": RotatedGold(single, keep), "empty": EmptyCache()}
             probs = dict(zip(jobs, run_streams(head, spec, list((diar, p) for p in jobs.values()))))
@@ -78,6 +104,8 @@ def stream_scores(host, readout, head, spec, windows, theta_act=None, theta_writ
     g, rr = out["gold"]["single_acc"], out["rot"]["single_acc"]
     out["rotation_follow"] = None if g is None or rr is None else rr - out["rot_asis"]["single_acc"]
     out["theta_act"], out["theta_write"], out["n_windows"] = theta_act, theta_write, len(windows)
+    if dlg:
+        out["dlg"] = {k: {"ce": a[0] / max(a[1], 1), "acc": a[2] / max(a[1], 1), "n": a[1]} for k, a in dlg.items()}
     if dump is not None:
         (dump / "meta.json").write_text(json.dumps({"time_base": "audio", "label_shift": spec.label_shift,
                                                     "policies": list(rows)[:4]}, indent=1))
@@ -89,7 +117,12 @@ def summary_line(res):
     return (f"self single {f(res['self']['single_acc'])} change {f(res['self']['change_acc'])} der {f(res['self']['der'])} | "
             f"gold single {f(res['gold']['single_acc'])} change {f(res['gold']['change_acc'])} | "
             f"empty single {f(res['empty']['single_acc'])} change {f(res['empty']['change_acc'])} | "
-            f"rotation_follow {f(res['rotation_follow'])}")
+            f"rotation_follow {f(res['rotation_follow'])}"
+            + ("" if "dlg" not in res else
+               " | dlg ce text {:.3f} stoken {:.3f} control {:.3f} | ctrl acc {:.3f} start acc {}".format(
+                   res["dlg"]["text"]["ce"], res["dlg"]["stoken"]["ce"], res["dlg"]["control"]["ce"],
+                   res["dlg"]["control"]["acc"],
+                   f(res["dlg"]["control_start"]["acc"]) if "control_start" in res["dlg"] else "  -  ")))
 
 
 def build_from_blob(blob, device, code_dir, model_dir=None, host_kind=None):
@@ -104,11 +137,12 @@ def build_from_blob(blob, device, code_dir, model_dir=None, host_kind=None):
 
     hc, lc = blob["host_config"], blob["lora_config"]
     kind = host_kind or hc["kind"]
+    dialogue = bool(hc.get("dialogue", False))
     if kind == "tiny":
-        host = tiny_host(code_dir, llm_layers=hc["llm_layers"]).to(device)
+        host = tiny_host(code_dir, llm_layers=hc["llm_layers"], dialogue=dialogue).to(device)
     else:
         host = LycheeHost.from_pretrained(model_dir or hc["model_dir"], code_dir, device, hc["llm_layers"],
-                                          attn=hc.get("attn", "sdpa"))
+                                          attn=hc.get("attn", "sdpa"), dialogue=dialogue)
     host.apply_lora(**lc)
     load_lora_state(host, blob["lora"])
     rc = blob["readout_config"]
@@ -139,7 +173,8 @@ def main():
 
     blob = torch.load(cfg.ckpt, map_location="cpu", weights_only=False)
     host, readout, head, spec = build_from_blob(blob, cfg.device, cfg.code_dir, cfg.model_dir)
-    windows = eval_windows(load_manifest(cfg.manifest), cfg.seconds, cfg.clips, spec.align)
+    windows = eval_windows(load_manifest(cfg.manifest), cfg.seconds, cfg.clips, spec.align,
+                           dialogue=getattr(host, "dialogue", False))
     res = stream_scores(host, readout, head, spec, windows, cfg.theta_act, cfg.theta_write, cfg.dump)
     res.update({"ckpt": str(cfg.ckpt), "step": blob.get("step"), "manifest": str(cfg.manifest),
                 "seconds": cfg.seconds, "head_spec": blob["head_spec"]})

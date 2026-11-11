@@ -206,3 +206,17 @@ PUSH=1 bash scripts/run_spk.sh       # same, then push results/spk/<name>/*.json
 
 Laptop checks (torch + transformers + librosa + soundfile; tiny random Lychee-shaped host):
 `python -m unittest tests.test_spk -v`
+
+### With Lychee's own dialogue loss (AMI / IF / IF-self-distill, multi-track)
+
+One participant per crop is the agent: the others' tracks are the input, and the agent's
+turns become Lychee's text / speech-token / control targets. See the "Dialogue loss"
+section of [docs/SPK_HEAD_LYCHEE.md](docs/SPK_HEAD_LYCHEE.md).
+
+```bash
+MP=/work/b12901015/mpmoshi-train SMOKE=1 bash scripts/run_spk_mt.sh   # 12 recordings/pool, 20 steps
+MP=/work/b12901015/mpmoshi-train bash scripts/run_spk_mt.sh           # manifests + speech tokens once, train, eval
+```
+
+Laptop checks: `python -m unittest tests.test_spk tests.test_mt -v`
+

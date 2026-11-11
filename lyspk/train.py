@@ -16,9 +16,19 @@ One micro-batch = one recording crop (30-60 s by default, starting on a 0.4 s wi
        + keep_weight x relative drift of trunk layer L (or the adaptor output when L = 0)
                        from the frozen model                   (lyspk.host.keep_loss)
 
-The last term stands in for mpmoshi's dialogue loss: there is no Lychee dialogue data
-here, so instead of training the conversation the LoRA is held to the frozen model at
-the one tensor everything downstream reads. --keep-weight 0 frees it.
+With --dialogue (multi-track manifests from lyspk.mt_data + lyspk.stoken: AMI / IF / SD)
+mpmoshi's dialogue loss is back, as Lychee's own: one participant per crop is the agent,
+the input is everyone else's tracks summed, the head labels only the others, and the
+agent's turns are teacher-forced into the text / stoken / control channels (lyspk.dialog):
+
+       + dlg_weight x (text CE + stoken CE + control CE)       (LycheeHost.dialogue_losses)
+
+The keep term then defaults to 0 (--keep-weight sets it). Without --dialogue the keep
+term stands in for it: the LoRA is held to the frozen model at the one tensor everything
+downstream reads.
+
+  python -m lyspk.train --dialogue --train work/spk/mt/if_train.turns.jsonl work/spk/mt/ami_train.turns.jsonl \
+      --val work/spk/mt/if_test.turns.jsonl --name mt
 
   python -m lyspk.train --train work/spk/synth/train.jsonl --val work/spk/synth/val.jsonl --name main
   python -m lyspk.train --host tiny --device cpu ... --steps 3      # CPU smoke, no checkpoint
@@ -42,7 +52,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from lyprobe.common import PROJECT_ROOT, setup_project_cache  # noqa: E402
-from lyspk.data import crop_labels, load_frames, load_manifest, n_frames  # noqa: E402
+from lyspk.data import crop_labels, is_multitrack, load_frames, load_manifest, load_turns, n_frames, view  # noqa: E402
 from lyspk.labels import assert_arrival, crop_frames  # noqa: E402
 
 
@@ -57,6 +67,8 @@ def lr_multiplier(step, warmup, total):
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--train", type=Path, nargs="+", required=True, help="manifests; sampled evenly per manifest")
+    ap.add_argument("--train-weights", type=float, nargs="+", default=None,
+                    help="draw probability per --train manifest (normalised), e.g. 0.4 0.4 0.2")
     ap.add_argument("--val", type=Path, default=None)
     ap.add_argument("--name", default="main")
     ap.add_argument("--run-dir", type=Path, default=None, help="default work/spk/runs/<name>")
@@ -87,7 +99,10 @@ def parse_args(argv=None):
     ap.add_argument("--crop-min", type=float, default=30.0, help="seconds")
     ap.add_argument("--crop-max", type=float, default=60.0, help="seconds; shorter recordings are used whole")
     ap.add_argument("--con-weight", type=float, default=0.2)
-    ap.add_argument("--keep-weight", type=float, default=1.0)
+    ap.add_argument("--keep-weight", type=float, default=None, help="default 1.0, or 0.0 with --dialogue")
+    ap.add_argument("--dialogue", action="store_true",
+                    help="load all of Lychee and add its own text/stoken/control loss on the agent's turns")
+    ap.add_argument("--dlg-weight", type=float, default=1.0)
     # bookkeeping
     ap.add_argument("--eval-every", type=int, default=250)
     ap.add_argument("--eval-clips", type=int, default=16)
@@ -114,14 +129,17 @@ def build(cfg):
     spec = PRESETS[cfg.mode]
     if spec.label_shift != 0:
         raise SystemExit(f"{cfg.mode} has label_shift {spec.label_shift}; Lychee's features need 0")
+    if cfg.dialogue and cfg.llm_layers < 1:
+        raise SystemExit("--dialogue needs --llm-layers >= 1 (the agent tokens enter through the trunk)")
     if cfg.host == "tiny":
-        host = tiny_host(cfg.code_dir, llm_layers=min(cfg.llm_layers, 2), grad_ckpt=not cfg.no_grad_ckpt)
+        host = tiny_host(cfg.code_dir, llm_layers=min(cfg.llm_layers, 2), grad_ckpt=not cfg.no_grad_ckpt,
+                         dialogue=cfg.dialogue)
         host = host.to(cfg.device)
     else:
         from lyprobe.extract_lychee import resolve_model_dir
         cfg.model_dir = resolve_model_dir(cfg.model_dir)
         host = LycheeHost.from_pretrained(cfg.model_dir, cfg.code_dir, cfg.device, cfg.llm_layers,
-                                          attn=cfg.attn, grad_ckpt=not cfg.no_grad_ckpt)
+                                          attn=cfg.attn, grad_ckpt=not cfg.no_grad_ckpt, dialogue=cfg.dialogue)
     lora_config = {"enc_rank": cfg.enc_lora_rank, "llm_rank": cfg.llm_lora_rank,
                    "adaptor_rank": cfg.adaptor_lora_rank, "scaling": cfg.lora_scaling}
     n_lora = host.apply_lora(**lora_config)
@@ -129,14 +147,20 @@ def build(cfg):
     head = SortformerHead(384, spec=spec).to(cfg.device)
     tau = torch.nn.Parameter(torch.tensor(0.1, device=cfg.device))
     host_config = {"kind": cfg.host, "model_dir": str(cfg.model_dir), "llm_layers": host.llm_layers,
-                   "attn": cfg.attn}
+                   "attn": cfg.attn, "dialogue": bool(cfg.dialogue)}
     return host, readout, head, tau, spec, lora_config, host_config, n_lora
 
 
 def main(argv=None):
     cfg = parse_args(argv)
+    if cfg.keep_weight is None:
+        cfg.keep_weight = 0.0 if cfg.dialogue else 1.0
     setup_project_cache()
+    import random
+
     import torch
+
+    from lyspk.dialog import crop_sequence
 
     from lyspk.contrast import push_queue, segments, supcon
     from lyspk.evaluate import eval_windows, stream_scores, summary_line
@@ -153,7 +177,19 @@ def main(argv=None):
     for p, rows in zip(cfg.train, train_sets):
         if not rows:
             raise SystemExit(f"{p} is empty")
-    val_windows = eval_windows(load_manifest(cfg.val), cfg.eval_seconds, cfg.eval_clips) if cfg.val else []
+        if cfg.dialogue:
+            n_mt = sum(is_multitrack(r) for r in rows)
+            n_turns = sum(bool(r.get("turns")) for r in rows)
+            print(f"{p}: {len(rows)} rows, {n_mt} multi-track, {n_turns} with agent turns")
+    if cfg.dialogue and not any(r.get("turns") for rows in train_sets for r in rows):
+        raise SystemExit("--dialogue: no row has turns; run lyspk.stoken on the multi-track manifests first")
+    py_rng = random.Random(cfg.seed)
+    if cfg.train_weights is not None and len(cfg.train_weights) != len(train_sets):
+        raise SystemExit(f"--train-weights has {len(cfg.train_weights)} values for {len(train_sets)} manifests")
+    mix = np.asarray(cfg.train_weights or [1.0] * len(train_sets), float)
+    mix = mix / mix.sum()
+    val_windows = eval_windows(load_manifest(cfg.val), cfg.eval_seconds, cfg.eval_clips,
+                               dialogue=cfg.dialogue) if cfg.val else []
 
     host, readout, head, tau, spec, lora_config, host_config, n_lora = build(cfg)
     enc_lora = [p for n, p in host.named_parameters() if "lora_" in n and n.startswith("encoder.")]
@@ -213,16 +249,28 @@ def main(argv=None):
         print(f"EVAL step {step}: {summary_line(res)}", flush=True)
 
     def draw():
-        rows = train_sets[int(rng.integers(len(train_sets)))]
+        rows = train_sets[int(rng.choice(len(train_sets), p=mix))]
         r = rows[int(rng.integers(len(rows)))]
+        seq = None
+        if is_multitrack(r):
+            cand = list(r.get("agents") or [])
+            if cfg.dialogue and r.get("turns"):
+                have = load_turns(r)
+                cand = [a for a in cand if have.get(a)]
+            r = view(r, cand[int(rng.integers(len(cand)))] if cand else None)
         f0, f1 = crop_frames(n_frames(r), rng, cfg.crop_min, cfg.crop_max, align=spec.align)
+        if cfg.dialogue and r.get("turns"):
+            f0, seq, _ = crop_sequence(r["turns"], f0, f1, host.text_fn, host.stoken_delay, rng=py_rng,
+                                       align=spec.align)
+            if seq is None:
+                return None
         if f1 - f0 < 4 * spec.align:
             return None
         y, single, keep, slots, first = crop_labels(r, f0, f1, spec.label_shift)
         if float(y.sum()) <= 0:
             return None
         assert_arrival(y, first, r["id"])
-        return r, f0, f1, y, single, keep, slots, first
+        return r, f0, f1, y, single, keep, slots, first, seq
 
     host.train()
     readout.train()
@@ -243,13 +291,13 @@ def main(argv=None):
                 if misses > 1000:
                     raise SystemExit("1000 draws in a row gave no usable crop: check the manifests' segments")
                 continue
-            r, f0, f1, y, single, keep, slots, first = got
+            r, f0, f1, y, single, keep, slots, first, seq = got
             wave = load_frames(r, f0, f1)
             ref = None
             if cfg.keep_weight > 0:
                 with torch.no_grad(), lora_disabled():
-                    ref = host.features(wave)["keep"]
-            out = host.features(wave)
+                    ref = host.features(wave, seq)["keep"]
+            out = host.features(wave, seq, losses=cfg.dialogue)
             diar, con = readout(out["stacks"])
             items = sample_batch(y, single, keep, first, rng, spec=spec)
             dloss, dparts = diar_loss(head, diar, items, spec)
@@ -257,6 +305,13 @@ def main(argv=None):
             closs, cst = supcon(emb, ids, peers, queue, tau)
             kloss = keep_loss(out["keep"], ref) if ref is not None else diar.sum() * 0.0
             loss = dloss + cfg.con_weight * closs + cfg.keep_weight * kloss
+            dlg = {}
+            if "dlg" in out:
+                d = out["dlg"]
+                loss = loss + cfg.dlg_weight * (d["text"][0] + d["stoken"][0] + d["control"][0])
+                dlg = {f"dlg_{k}": float(v[0].detach()) for k, v in d.items()}
+                dlg.update({f"n_{k}": v[1] for k, v in d.items()})
+                dlg["ctrl_acc"] = d["control"][2] / max(d["control"][1], 1)
             (loss / cfg.accum).backward()
             if emb is not None:
                 peers.append((emb.detach(), ids))
@@ -264,7 +319,7 @@ def main(argv=None):
                           "n_items": dparts["n_items"], "con": float(closs.detach()), "con_pos": cst["n_pos"],
                           "con_rel": float(closs.detach()) / cst["chance"] if cst.get("chance") else 0.0,
                           "con_cross": cst.get("n_cross", 0), "keep": float(kloss.detach()),
-                          "frames": int(f1 - f0), "source": r["source"]})
+                          "frames": int(f1 - f0), "source": r["source"], **dlg})
             done += 1
         params = [p for g in opt.param_groups for p in g["params"]]
         gnorm = float(torch.nn.utils.clip_grad_norm_(params, cfg.clip))
@@ -272,7 +327,8 @@ def main(argv=None):
         for e, i in peers:
             push_queue(queue, e, i)
         step += 1
-        rec = {k: float(np.mean([p[k] for p in parts])) for k in parts[0] if k != "source"}
+        keys = sorted({k for p in parts for k in p} - {"source"})
+        rec = {k: float(np.mean([p[k] for p in parts if k in p])) for k in keys}
         rec.update({"step": step, "lr_mult": mult, "grad_norm": gnorm, "sec": time.time() - t0,
                     "tau": float(tau.detach()), "queue": len(queue), "elapsed_h": (time.time() - t_start) / 3600})
         log.write(json.dumps(rec) + "\n")
@@ -282,7 +338,9 @@ def main(argv=None):
             top = {k: int(np.argmax(v)) for k, v in w.items()}
             print(f"step {step} loss {rec['loss']:.4f} sort {rec['diar_sort']:.4f} pil {rec['diar_pil']:.4f} "
                   f"con {rec['con']:.3f} (/chance {rec['con_rel']:.2f}) keep {rec['keep']:.4f} gn {gnorm:.2f} {rec['sec']:.1f}s "
-                  f"top-layer {top}", flush=True)
+                  f"top-layer {top}" + (f" | dlg text {rec['dlg_text']:.3f} stoken {rec['dlg_stoken']:.3f} "
+                                        f"control {rec['dlg_control']:.3f} acc {rec['ctrl_acc']:.2f}"
+                                        if "dlg_text" in rec else ""), flush=True)
         if cfg.eval_every and step % cfg.eval_every == 0:
             evaluate()
         if cfg.save_every and step % cfg.save_every == 0:

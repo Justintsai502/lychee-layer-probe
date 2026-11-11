@@ -10,3 +10,5 @@ soundfile
 scipy
 numpy
 matplotlib
+s3tokenizer           # lyspk.stoken: Step-Audio-2's speech tokenizer (speech_tokenizer_v2_25hz.onnx)
+huggingface_hub       # downloads that tokenizer file

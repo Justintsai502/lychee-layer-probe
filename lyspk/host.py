@@ -23,6 +23,14 @@ trunk, which the preservation target pins; see ``keep``).
 output at every suffix slot (or the adaptor output when L = 0). Matching it to the
 frozen model's value keeps the rest of Lychee computing what it computed before.
 
+Dialogue mode (``from_pretrained(..., dialogue=True)``, lyspk.dialog builds the inputs):
+the whole trunk, the speech-token branch + merge branch, the control branch and the LM
+head stay loaded, frozen, and ``features(wave, seq, losses=True)`` also returns Lychee's
+own three losses on the agent's turns, computed as LycheeFD.forward does (shifted CE,
+clamped vocab ranges), but with the LM head applied only at labelled positions. LoRA
+stays where it was (encoder, adaptor, trunk 1..L); gradients reach it through the frozen
+upper layers. Without ``losses`` the forward stops after trunk layer L.
+
 Model deps (lazy): torch, librosa, transformers==4.57.x (and the Lychee code in
 third_party/lychee_fd_model, scripts/fetch_lychee_code.sh)
 """
@@ -39,11 +47,17 @@ import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from lyprobe.layout import CHUNK_S, SR, SYSTEM_MESSAGE_PREFIX, TOK, listening_suffix  # noqa: E402
+from lyspk.dialog import CONTROL_RANGE, IGNORE, STOKEN_DELAY, STOKEN_RANGE  # noqa: E402
+from lyspk.dialog import TOK as DTOK  # noqa: E402
 from lyspk.lora import QWEN2_LINEARS, wrap_linears  # noqa: E402
 
 WIN = int(round(CHUNK_S * SR))        # 6400 samples per window
 FEATS_PER_WIN = 5
 ENC_PER_FEAT = 4                      # 50 Hz encoder frames per 12.5 Hz feature
+
+
+class _Stop(Exception):
+    """Raised from a forward hook to end the trunk after the last layer the readout reads."""
 
 
 def _import_lychee(code_dir):
@@ -54,7 +68,8 @@ def _import_lychee(code_dir):
 
 class LycheeHost(nn.Module):
     def __init__(self, encoder, adapter, lm, embed, prefix_ids, *, llm_layers, no_text_label=False,
-                 no_stoken_label=False, grad_ckpt=True, mask_fns=None):
+                 no_stoken_label=False, grad_ckpt=True, mask_fns=None, branches=None, text_fn=None,
+                 stoken_delay=STOKEN_DELAY):
         super().__init__()
         self.encoder, self.adapter = encoder, adapter
         self.lm, self.embed = lm, embed
@@ -63,7 +78,17 @@ class LycheeHost(nn.Module):
         self.no_text_label, self.no_stoken_label = bool(no_text_label), bool(no_stoken_label)
         self.grad_ckpt = bool(grad_ckpt)
         self._make_mask, self._mask_bias = mask_fns
-        if self.llm_layers and (lm is None or len(lm.layers) != self.llm_layers):
+        self.dialogue = branches is not None
+        self.text_fn, self.stoken_delay = text_fn, int(stoken_delay)
+        if self.dialogue:
+            if not self.llm_layers:
+                raise ValueError("dialogue mode needs the trunk (llm_layers >= 1)")
+            self.stoken_model, self.merge_model = branches["stoken"], branches["merge"]
+            self.control_model, self.lm_head = branches["control"], branches["lm_head"]
+            self.stoken_index, self.control_index = int(branches["stoken_index"]), int(branches["control_index"])
+            if not self.llm_layers <= len(lm.layers):
+                raise ValueError(f"llm_layers {self.llm_layers} > trunk depth {len(lm.layers)}")
+        elif self.llm_layers and (lm is None or len(lm.layers) != self.llm_layers):
             raise ValueError(f"trunk must be cut to {self.llm_layers} layers")
         for p in self.parameters():
             p.requires_grad_(False)
@@ -72,7 +97,7 @@ class LycheeHost(nn.Module):
     # ------------------------------------------------------------ construction
 
     @classmethod
-    def from_pretrained(cls, model_dir, code_dir, device, llm_layers, attn="sdpa", grad_ckpt=True):
+    def from_pretrained(cls, model_dir, code_dir, device, llm_layers, attn="sdpa", grad_ckpt=True, dialogue=False):
         from transformers import AutoTokenizer
 
         m = _import_lychee(code_dir)
@@ -91,17 +116,29 @@ class LycheeHost(nn.Module):
         n_trunk = len(model.model.layers)
         if not 0 <= llm_layers <= n_trunk:
             raise SystemExit(f"--llm-layers {llm_layers}: the trunk has {n_trunk} layers")
-        lm = embed = None
+        lm = embed = branches = text_fn = None
         if llm_layers:
             lm = model.model
-            lm.layers = nn.ModuleList(list(lm.layers)[:llm_layers])
+            if not dialogue:
+                lm.layers = nn.ModuleList(list(lm.layers)[:llm_layers])
             embed = lm.embed_tokens
+        if dialogue:
+            check_token_ids(cfg, tok)
+            if model.merge_model is None or model.stoken_model is None or model.control_model is None:
+                raise SystemExit("dialogue mode expects the stoken, merge and control branches")
+            for b in (model.stoken_model, model.merge_model, model.control_model):
+                b.embed_tokens = None       # the branches only ever take inputs_embeds: 3 x 1.1 GB freed
+            branches = {"stoken": model.stoken_model, "merge": model.merge_model, "control": model.control_model,
+                        "lm_head": model.lm_head, "stoken_index": model.stoken_model_index,
+                        "control_index": model.control_model_index}
+            text_fn = lambda text: tok.encode(text, add_special_tokens=False)  # noqa: E731
         host = cls(model.encoder, model.adapter, lm, embed, prefix, llm_layers=llm_layers,
                    no_text_label=model.no_text_label, no_stoken_label=model.no_stoken_label,
-                   grad_ckpt=grad_ckpt, mask_fns=(m.make_non_pad_mask, m.mask_to_bias))
-        host.meta = {"model_dir": str(model_dir), "trunk_layers": n_trunk,
+                   grad_ckpt=grad_ckpt, mask_fns=(m.make_non_pad_mask, m.mask_to_bias), branches=branches,
+                   text_fn=text_fn, stoken_delay=int(getattr(cfg, "stoken_delay_num", STOKEN_DELAY) or 0))
+        host.meta = {"model_dir": str(model_dir), "trunk_layers": n_trunk, "dialogue": bool(dialogue),
                      "control_branch_at": int(model.control_model_index),
-                     "speech_branch_at": int(model.stoken_model_index)}
+                     "speech_branch_at": int(model.stoken_model_index), "stoken_delay": host.stoken_delay}
         del model
         return host.to(device)
 
@@ -118,10 +155,12 @@ class LycheeHost(nn.Module):
         if adaptor_rank and self.llm_layers:
             n["adaptor"] = wrap_linears(self.adapter, adaptor_rank, scaling, names=("linear1", "linear2"))
         if llm_rank and self.llm_layers:
-            for layer in self.lm.layers:
+            for layer in list(self.lm.layers)[:self.llm_layers]:
                 n["llm"] += wrap_linears(layer, llm_rank, scaling, names=QWEN2_LINEARS)
         if self.llm_layers and self.grad_ckpt:
-            self.lm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+            mods = [self.lm] + ([self.stoken_model, self.merge_model, self.control_model] if self.dialogue else [])
+            for mod in mods:
+                mod.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         return n
 
     def groups(self) -> dict:
@@ -186,11 +225,16 @@ class LycheeHost(nn.Module):
             raise RuntimeError(f"expected 20 valid encoder frames per window, got {n50}")
         return outs, y, (wav_lens + 1) // 2 // 2
 
-    def embeds(self, ada):
-        """LycheeFD.forward's input embedding (training path) with ``ada`` [T, H] in the patch slots."""
+    def embeds(self, ada, seq=None):
+        """LycheeFD.forward's input embedding (training path) with ``ada`` [T, H] in the patch slots.
+        ``seq`` (lyspk.dialog.build_sequence) replaces the listening text / stoken / control channels."""
         n_frames = ada.shape[0]
         n_chunks = n_frames // FEATS_PER_WIN
         text, stoken, control, audio = listening_suffix(n_chunks)
+        if seq is not None:
+            if len(seq["text"]) != len(text):
+                raise ValueError(f"sequence has {len(seq['text'])} slots, audio gives {len(text)}")
+            text, stoken, control = (np.asarray(seq[k]).tolist() for k in ("text", "stoken", "control"))
         dev = self.device
         ids = lambda x: torch.tensor(x, dtype=torch.long, device=dev)  # noqa: E731
         E = self.embed
@@ -207,22 +251,73 @@ class LycheeHost(nn.Module):
         aud = aud.index_copy(0, patch, ada.to(aud.dtype))
         return torch.cat([pre, suf + aud], 0).unsqueeze(0), len(self.prefix_ids)
 
-    def run_trunk(self, embeds):
-        """Outputs of trunk layers 1..L at every position, via forward hooks: [L, S, H]."""
+    def run_trunk(self, embeds, full=False):
+        """Outputs of trunk layers 1..L at every position, via forward hooks: [L, S, H].
+        ``full``: run every trunk layer and also return the model output (hidden_states and the
+        final normed state); otherwise stop right after layer L."""
         got = {}
-        hooks = [layer.register_forward_hook(
-            lambda mod, args, out, i=i: got.__setitem__(i, out[0] if isinstance(out, tuple) else out))
-            for i, layer in enumerate(self.lm.layers)]
+        stop_at = self.llm_layers - 1 if not full and len(self.lm.layers) > self.llm_layers else None
+
+        def hook(mod, args, out, i):
+            got[i] = out[0] if isinstance(out, tuple) else out
+            if i == stop_at:
+                raise _Stop
+
+        hooks = [layer.register_forward_hook(lambda mod, args, out, i=i: hook(mod, args, out, i))
+                 for i, layer in enumerate(list(self.lm.layers)[:self.llm_layers])]
+        res = None
         try:
-            self.lm(inputs_embeds=embeds, use_cache=False, return_dict=True)
+            res = self.lm(inputs_embeds=embeds, use_cache=False, return_dict=True, output_hidden_states=full)
+        except _Stop:
+            pass
         finally:
             for h in hooks:
                 h.remove()
-        return [got[i][0] for i in range(self.llm_layers)]
+        layers = [got[i][0] for i in range(self.llm_layers)]
+        return (layers, res) if full else layers
 
-    def features(self, wave):
+    def _ce(self, h, labels, lo, hi):
+        """LycheeFD.clamp_loss_fn (logits[i] predicts labels[i + 1], vocab cut to [lo, hi)) with the
+        LM head applied only where a label exists. Returns (loss, n, n_correct)."""
+        lab = labels[1:]
+        pos = torch.nonzero(lab != IGNORE).squeeze(1)
+        if len(pos) == 0:
+            return h.sum() * 0.0, 0, 0
+        w = self.lm_head.weight[lo:hi]
+        logits = (h[:-1][pos] @ w.T).float()
+        target = lab[pos] - lo
+        loss = F.cross_entropy(logits, target)
+        return loss, int(len(pos)), int((logits.argmax(-1) == target).sum())
+
+    def dialogue_losses(self, res, emb, seq, n_prefix):
+        """Text, stoken and control CE (LycheeFD.forward's three branches) for one sequence."""
+        dev = emb.device
+        pad = lambda a: torch.cat([torch.full((n_prefix,), IGNORE, dtype=torch.long, device=dev),  # noqa: E731
+                                   torch.as_tensor(np.asarray(a), dtype=torch.long, device=dev)])
+        hs = res.hidden_states
+        out = {}
+        h_text = res.last_hidden_state[0]
+        out["text"] = self._ce(h_text, pad(seq["text_label"]), 0, self.lm_head.weight.shape[0])
+        st = self.stoken_model(inputs_embeds=hs[self.stoken_index], use_cache=False, return_dict=True).last_hidden_state
+        ids = torch.cat([torch.tensor(self.prefix_ids, dtype=torch.long, device=dev),
+                         torch.as_tensor(np.asarray(seq["text"]), dtype=torch.long, device=dev)])
+        txt = self.embed(ids).detach()
+        shifted = torch.zeros_like(txt)
+        shifted[:-1] = txt[1:]
+        mg = self.merge_model(inputs_embeds=st + shifted.unsqueeze(0), use_cache=False,
+                              return_dict=True).last_hidden_state[0]
+        out["stoken"] = self._ce(mg, pad(seq["stoken_label"]), *STOKEN_RANGE)
+        ct = self.control_model(inputs_embeds=hs[self.control_index], use_cache=False,
+                                return_dict=True).last_hidden_state[0]
+        out["control"] = self._ce(ct, pad(seq["control_label"]), *CONTROL_RANGE)
+        if "control_label_start" in seq:      # eval: start_* positions only
+            out["control_start"] = self._ce(ct, pad(seq["control_label_start"]), *CONTROL_RANGE)
+        return out
+
+    def features(self, wave, seq=None, losses=False):
         """``wave`` (16 kHz, multiple of 0.4 s) -> {'stacks': {'enc': [33, T, 1280], 'llm': [L+1, T, 3584]},
-        'keep': the preservation target, 'T': frames}."""
+        'keep': the preservation target, 'T': frames}. ``seq``: agent tokens in the suffix
+        (lyspk.dialog); with ``losses`` (dialogue mode) also 'dlg': {text|stoken|control: (loss, n, correct)}."""
         wavs, lens = self.windows(wave)
         outs, pooled, _ = self.run_encoder(wavs, lens)
         n_win = wavs.shape[0]
@@ -236,11 +331,16 @@ class LycheeHost(nn.Module):
         ada = self.adapter(pooled)[:, :FEATS_PER_WIN].reshape(T, -1)
         if not self.llm_layers:
             return {"stacks": stacks, "keep": ada, "T": T}
-        emb, n_prefix = self.embeds(ada)
-        layers = self.run_trunk(emb)
+        emb, n_prefix = self.embeds(ada, seq)
+        full = bool(losses and self.dialogue and seq is not None)
+        got = self.run_trunk(emb, full=full)
+        layers, res = got if full else (got, None)
         slots = n_prefix + 2 * torch.arange(T, device=emb.device)
         stacks["llm"] = torch.stack([emb[0, slots]] + [h[slots] for h in layers])
-        return {"stacks": stacks, "keep": layers[-1][n_prefix:], "T": T}
+        out = {"stacks": stacks, "keep": layers[-1][n_prefix:], "T": T}
+        if full:
+            out["dlg"] = self.dialogue_losses(res, emb, seq, n_prefix)
+        return out
 
 
 def keep_loss(h, ref):
@@ -249,24 +349,59 @@ def keep_loss(h, ref):
     return ((h - ref) ** 2).mean() / (ref ** 2).mean().clamp_min(1e-6)
 
 
-def tiny_host(code_dir, llm_layers=2, seed=0, grad_ckpt=True):
+def check_token_ids(cfg, tok):
+    """The ids lyspk.dialog hard-codes must be the checkpoint's."""
+    want = {"start_speaking": cfg.start_speaking_token_id, "start_listening": cfg.start_listening_token_id,
+            "keep_listening": cfg.keep_listening_token_id, "keep_speaking": cfg.keep_speaking_token_id,
+            "detect": cfg.detect_token_id, "sleep": cfg.sleep_token_id, "text_pad": cfg.text_pad_token_id,
+            "stoken_pad": cfg.stoken_pad_token_id, "stoken_delay": cfg.stoken_delay_token_id,
+            "tts_start": tok.convert_tokens_to_ids("<tts_start>"), "tts_end": tok.convert_tokens_to_ids("<tts_end>"),
+            "tts_pad": tok.convert_tokens_to_ids("<tts_pad>"), "eot": tok.convert_tokens_to_ids("<|EOT|>"),
+            "audio_patch": tok.convert_tokens_to_ids("<audio_patch>")}
+    bad = {k: (DTOK[k], v) for k, v in want.items() if int(v) != DTOK[k]}
+    if tok.convert_tokens_to_ids("<audio_0>") != 151696:
+        bad["<audio_0>"] = (151696, tok.convert_tokens_to_ids("<audio_0>"))
+    if (cfg.stoken_token_ids_min, cfg.stoken_token_ids_max) != STOKEN_RANGE:
+        bad["stoken_range"] = (STOKEN_RANGE, (cfg.stoken_token_ids_min, cfg.stoken_token_ids_max))
+    if (cfg.control_token_ids_min, cfg.start_bc_token_id + 1) != CONTROL_RANGE:
+        bad["control_range"] = (CONTROL_RANGE, (cfg.control_token_ids_min, cfg.start_bc_token_id + 1))
+    if bad:
+        raise SystemExit(f"token ids differ from lyspk/dialog.py (expected, checkpoint): {bad}")
+
+
+def tiny_text_fn(text):
+    return [100 + (ord(c) % 1000) for c in str(text)]
+
+
+def tiny_host(code_dir, llm_layers=2, seed=0, grad_ckpt=True, dialogue=False):
     """A randomly initialised host with Lychee's exact module types at toy sizes, for CPU
-    tests and ``train.py --host tiny`` (no checkpoint needed)."""
+    tests and ``train.py --host tiny`` (no checkpoint needed). ``dialogue``: a 4-layer trunk
+    with 1-layer stoken / merge / control branches (at trunk layers 3 / - / 2) and an LM head."""
     from transformers import Qwen2Config, Qwen2Model
 
     m = _import_lychee(code_dir)
     torch.manual_seed(seed)
     enc = m.AudioEncoder(n_mels=128, n_ctx=1500, n_state=64, n_head=4, n_layer=3)
     ada = m.Adaptor(64, 96, kernel_size=3, stride=2)
-    lm = embed = None
-    if llm_layers:
-        cfg = Qwen2Config(vocab_size=max(TOK.values()) + 8, hidden_size=96, intermediate_size=192,
-                          num_hidden_layers=llm_layers, num_attention_heads=4, num_key_value_heads=2,
-                          max_position_embeddings=8192)
+    lm = embed = branches = None
+    vocab = max(max(TOK.values()), max(DTOK.values())) + 8
+
+    def qwen(n):
+        cfg = Qwen2Config(vocab_size=vocab, hidden_size=96, intermediate_size=192, num_hidden_layers=n,
+                          num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=8192)
         cfg._attn_implementation = "eager"
-        lm = Qwen2Model(cfg)
+        return Qwen2Model(cfg)
+
+    if llm_layers:
+        lm = qwen(4 if dialogue else llm_layers)
         embed = lm.embed_tokens
+    if dialogue:
+        branches = {"stoken": qwen(1), "merge": qwen(1), "control": qwen(1),
+                    "lm_head": nn.Linear(96, vocab, bias=False), "stoken_index": 3, "control_index": 2}
+        for k in ("stoken", "merge", "control"):    # the branches take embeddings, never ids
+            branches[k].embed_tokens = None
     host = LycheeHost(enc, ada, lm, embed, prefix_ids=[1, 2, 3, 4], llm_layers=llm_layers,
-                      grad_ckpt=grad_ckpt, mask_fns=(m.make_non_pad_mask, m.mask_to_bias))
-    host.meta = {"model_dir": "tiny", "trunk_layers": llm_layers}
+                      grad_ckpt=grad_ckpt, mask_fns=(m.make_non_pad_mask, m.mask_to_bias), branches=branches,
+                      text_fn=tiny_text_fn if dialogue else None, stoken_delay=STOKEN_DELAY)
+    host.meta = {"model_dir": "tiny", "trunk_layers": 4 if dialogue else llm_layers, "dialogue": bool(dialogue)}
     return host
